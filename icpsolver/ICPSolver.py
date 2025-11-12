@@ -49,8 +49,7 @@ class ICPSolver(object):
     def downsample_points(
         self,
         points: np.ndarray,
-        num_samples: int,
-        seed: int = 42,
+        rate: float,
     ):
         """
         Downsample a point cloud to a specified number of samples.
@@ -59,28 +58,24 @@ class ICPSolver(object):
         ----------
         points : (n,3) float
         The input point cloud.
-        num_samples : int
-        The number of points to sample.
-        random_state : int
-        Seed for random number generator.
+        rate : float
+        The downsampling rate.
 
         Returns
         ----------
         sampled_points : (num_samples, 3) float
         The downsampled point cloud.
         """
-        np.random.seed(seed)
-        if points.shape[0] <= num_samples:
-            return points
-        else:
-            indices = np.random.choice(points.shape[0], num_samples, replace=False)
-            return points[indices]
+        indices = np.random.choice(
+            points.shape[0], int(points.shape[0] * rate), replace=False
+        )
+        return points[indices]
 
     def best_fit_transform(
         self,
         A: np.ndarray,
         B: np.ndarray,
-        weights: np.ndarray,
+        weights=None,
         reflection: bool = True,
         translation: bool = True,
         scale: bool = True,
@@ -132,9 +127,7 @@ class ICPSolver(object):
         A,
         B,
         initial=None,
-        threshold=1e-5,
-        max_iterations=20,
-        plotting=False,
+        plotting=True,
         **kwargs,
     ):
         """
@@ -182,6 +175,8 @@ class ICPSolver(object):
             raise ValueError("points must be (n,3)!")
         btree = cKDTree(B)
 
+        orig_A = A.copy()
+
         # transform a under initial_transformation
         A = trimesh.registration.transform_points(A, initial)
         total_matrix = initial
@@ -190,7 +185,7 @@ class ICPSolver(object):
         old_cost = np.inf
 
         # avoid looping forever by capping iterations
-        for i in range(max_iterations):
+        for i in range(self.max_iterations):
             # Closest point in b to each point in a
             distances, ix = btree.query(A, 1)
             closest = B[ix]
@@ -204,14 +199,28 @@ class ICPSolver(object):
             A = transformed
             total_matrix = np.dot(matrix, total_matrix)
 
-            if old_cost - cost < threshold:
+            if old_cost - cost < self.tolerance:
+                print(
+                    f"Converged at iteration {i}, cost: {cost}, change: {old_cost - cost}"
+                )
+                print(
+                    f"Plotting ICP iteration {i}, cost: {cost}, change: {old_cost - cost}"
+                )
+                self.plot_transform(
+                    orig_A,
+                    B,
+                    total_matrix,
+                    save_dir="results",
+                    iteration=str(i).zfill(3),
+                )
                 break
             else:
                 old_cost = cost
 
-            if plotting and (i % 5 == 0 or i == max_iterations - 1):
+            if plotting and (i % 5 == 0 or i == self.max_iterations - 1):
+                print(f"Plotting ICP iteration {i}, cost: {cost}")
                 self.plot_transform(
-                    A,
+                    orig_A,
                     B,
                     total_matrix,
                     save_dir="results",
@@ -235,13 +244,19 @@ class ICPSolver(object):
         """
         A_transformed = trimesh.registration.transform_points(A, transform)
 
+        file_dir = os.path.dirname(__file__)
+        save_dir = os.path.join(file_dir, save_dir)
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
 
+        A = self.downsample_points(A, rate=0.05)
+        B = self.downsample_points(B, rate=0.05)
+        A_transformed = self.downsample_points(A_transformed, rate=0.05)
+
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(B[:, 0], B[:, 1], B[:, 2], c="r", label="Target (B)", alpha=0.5)
-        ax.scatter(A[:, 0], A[:, 1], A[:, 2], c="b", label="Source (A)", alpha=0.5)
+        ax.scatter(B[:, 0], B[:, 1], B[:, 2], c="r", label="Target (B)", alpha=0.2)
+        ax.scatter(A[:, 0], A[:, 1], A[:, 2], c="b", label="Source (A)", alpha=0.2)
         ax.scatter(
             A_transformed[:, 0],
             A_transformed[:, 1],
