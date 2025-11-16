@@ -42,18 +42,17 @@ def test_icp_solver_bunny():
     )
 
     # Initialize the ICP solver
-    icp_solver = ICPSolver(max_iterations=100, tolerance=1e-8)
+    icp_solver = ICPSolver(
+        max_iterations=100, tolerance=1e-8, source=src_np, target=tgt_np
+    )
     print("Initialized ICPSolver.")
 
-    icp_solver.plot_transform(
-        src_np, tgt_np, np.eye(4), save_dir="results", iteration="000"
-    )
     # src_np = icp_solver.downsample_points(src_np, rate=0.1, seed=1)
     # tgt_np = icp_solver.downsample_points(tgt_np, rate=0.1, seed=1)
     # print(f"Downsampled point clouds to {src_np.shape[0]} points each.")
 
     # Perform ICP alignment
-    matrix, transformed, cost = icp_solver.icp(src_np, tgt_np)
+    matrix, transformed, cost = icp_solver.icp(reflection=False, scale=False)
 
     print("ICP alignment completed.")
     print(f"Final transformation matrix:\n{matrix}")
