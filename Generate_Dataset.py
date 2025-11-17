@@ -14,6 +14,12 @@ sys.path.insert(0, root_dir)
 
 import numpy as np
 import torch
+from pathlib import Path
+from PIL import Image
+
+
+import Renderer.tobypy as tobypy
+import torchvision
 
 # Import parameters and utilities
 # Note: These imports assume the script is run from the project root directory
@@ -30,16 +36,129 @@ from scene.cameras import Camera
 from gaussian_splatting.scene.dynamic_camera_loader import DynamicCameraLoader
 from FisherRF_Fresh.FisherRF.render_uncertainty import get_point_cloud_from_view
 from Trajectory_Selection.Trajectory_Candidates import prototype_candidates
+from Trajectory_Selection.Build_View import render_image
 
 
-def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=100, output_base_dir="CS229/dataset/3DGS_PC"):
+# ============ Renderer Helper Functions ============
+def to_xyz(q):
+    """Convert quaternion to xyz representation."""
+    w, x, y, z = q.tolist()
+    if w < 0:
+        return np.array([-x, -y, -z])
+    return np.array([x, y, z])
+
+
+def quat_inv(q):
+    """Compute quaternion inverse."""
+    w, x, y, z = q.tolist()
+    return np.array([w, -x, -y, -z])
+
+
+def dcm_from_quat(q: np.ndarray):
+    """Convert quaternion to direction cosine matrix."""
+    a, b, c, d = q.tolist()
+    aa = a * a
+    ab = a * b
+    ac = a * c
+    ad = a * d
+    bb = b * b
+    bc = b * c
+    bd = b * d
+    cc = c * c
+    cd = c * d
+    dd = d * d
+    ax = aa + bb - cc - dd
+    ay = 2. * (bc - ad)
+    az = 2. * (bd + ac)
+    bx = 2. * (bc + ad)
+    by = aa - bb + cc - dd
+    bz = 2. * (cd - ab)
+    cx = 2. * (bd - ac)
+    cy = 2. * (cd + ab)
+    cz = aa - bb - cc + dd
+    return np.array([ax, ay, az, bx, by, bz, cx, cy, cz]).reshape(3, 3)
+
+
+def normalize_vector(v):
+    """Normalize a vector to unit length."""
+    return v / np.linalg.norm(v)
+
+
+def render_gt_image(r_Vo2To_vbs_true, q_vbs2tango_true, tau_idx, output_base_dir, candidate_idx=None):
+    """
+    Render a ground truth image at the given pose using tobypy renderer.
+    
+    Args:
+        r_Vo2To_vbs_true: Relative position [3,] array
+        q_vbs2tango_true: Quaternion [4,] array
+        tau_idx: Time index for naming
+        output_base_dir: Base output directory
+        candidate_idx: Candidate index for organizing outputs
+    
+    Returns:
+        Tuple of (image_path, mask_path) or (None, None) if rendering failed
+    """
+
+
+    renderer = tobypy.make_renderer()
+    
+    # Create output directory for rendered images
+    if candidate_idx is not None:
+        output_dir = Path(output_base_dir) / "GT_Renderer" / str(candidate_idx)
+    else:
+        output_dir = Path(output_base_dir) / "GT_Renderer"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Sun direction (default: pointing backward in camera frame)
+    r_sun_cam = np.array([0.0, 0.0, -1.0])
+    
+    # Create renderer config
+    cfg = tobypy.RenderConfig()
+    cfg.camera = tobypy.Camera.PointGrey
+    cfg.draw_target = tobypy.TargetDrawMethod.DrawSemiResolved
+    cfg.r_target = np.array(r_Vo2To_vbs_true, dtype=np.float32)
+    cfg.q_target = np.array(to_xyz(q_vbs2tango_true), dtype=np.float32)
+    cfg.dir_sun_cam = np.array(normalize_vector(r_sun_cam), dtype=np.float32)
+    cfg.draw_stars = False
+    cfg.draw_mask = False
+    cfg.noise_index = tau_idx
+    
+    # Render the regular scene
+    image_data = renderer.render(cfg)
+
+    # Render the mask by just changing the flag
+    # TEMPORARILY DISABLED
+    # cfg.draw_mask = True
+    # mask_data = renderer.render(cfg)
+    # cfg.draw_mask = False  # Reset for safety
+    
+    # Invert colors to convert white background to black
+    image_inverted = 1.0 - image_data
+    
+    # Convert to PIL Image and save
+    image_pil = Image.fromarray((image_inverted * 255).astype(np.uint8))
+    # mask_pil = Image.fromarray((mask_data * 255).astype(np.uint8))
+    
+    image_path = output_dir / f"tau_{tau_idx:04d}_image.png"
+    # mask_path = output_dir / f"tau_{tau_idx:04d}_mask.png"
+    
+    image_pil.save(image_path)
+    # mask_pil.save(mask_path)
+    
+    return str(image_path), None  # Return None for mask_path
+
+
+
+def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=100, output_base_dir="CS229/dataset"):
     """
     Generate point cloud datasets from trajectory candidates.
     
     Args:
         trajectory_candidates: Array of ROE candidates. If None, uses prototype_candidates()
         num_tau_steps: Number of viewpoints to generate per candidate (default: 100 for 1 orbit)
-        output_base_dir: Base directory for saving point clouds
+        output_base_dir: Base directory (default: CS229/dataset)
+            - Point clouds saved to: output_base_dir/3DGS_PC/
+            - Rendered images saved to: output_base_dir/GT_Renderer/
     
     Returns:
         List of dictionaries containing info about generated datasets
@@ -146,8 +265,8 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
         print(f"Candidate {candidate_idx}/{len(trajectory_candidates)}: {trajectory_candidate}")
         print("-" * 80)
         
-        # Create output directory for this candidate
-        candidate_output_dir = os.path.join(output_base_dir, f"{candidate_idx}")
+        # Create output directory for this candidate's point clouds
+        candidate_output_dir = os.path.join(output_base_dir, "3DGS_PC", f"{candidate_idx}")
         os.makedirs(candidate_output_dir, exist_ok=True)
         
         # Track generated files for this candidate
@@ -187,6 +306,15 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
             # Quaternion rotating camera frame into chief's world frame
             q_vbs2tango_true = rotation_from_to(r_Vo2To_vbs_true, world_up)
             
+            # === Render Ground Truth Image ===
+            gt_image_path, gt_mask_path = render_gt_image(
+                r_Vo2To_vbs_true, 
+                q_vbs2tango_true, 
+                tau_idx, 
+                output_base_dir,
+                candidate_idx=candidate_idx
+            )
+            
             # Convert ROE to 3DGS pose
             pose = DynamicCameraLoader._convert_roe_to_3dgs(q_vbs2tango_true, r_Vo2To_vbs_true)
             
@@ -216,6 +344,11 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
                 scale=1.0,
                 data_device="cuda"
             )
+            
+            # === Render 3DGS image ===
+            gs_output_dir = os.path.join(output_base_dir, "3DGS_Renderer", str(candidate_idx))
+            os.makedirs(gs_output_dir, exist_ok=True)
+            render_image(camera, gaussians, pipeline, background, gs_output_dir, tau_idx)
             
             # Extract point cloud from this viewpoint
             ply_filename = f"{candidate_idx}_tau_{tau_idx}.ply"
@@ -263,7 +396,9 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
     print("=" * 80)
     print(f"Total candidates processed: {len(trajectory_candidates)}")
     print(f"Total point clouds generated: {len(trajectory_candidates) * actual_tau_steps}")
-    print(f"Output directory: {output_base_dir}")
+    print(f"Base output directory: {output_base_dir}")
+    print(f"  - Point clouds: {output_base_dir}/3DGS_PC/")
+    print(f"  - Rendered images: {output_base_dir}/GT_Renderer/")
     print("=" * 80)
     
     return dataset_info
@@ -274,7 +409,7 @@ if __name__ == "__main__":
     dataset_info = generate_dataset_from_candidates(
         trajectory_candidates=None,  # Uses prototype_candidates()
         num_tau_steps=100,            # 100 viewpoints for 1 orbit
-        output_base_dir="CS229_PointClouds/dataset/3DGS_PC"
+        output_base_dir="CS229_PointClouds/dataset"
     )
     
     print("\n✓ Dataset generation completed successfully!")
