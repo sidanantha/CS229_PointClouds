@@ -20,7 +20,13 @@ class ICPSolver(object):
     """
 
     def __init__(
-        self, max_iterations=20, tolerance=1e-5, source=None, target=None, weights=None
+        self,
+        max_iterations=20,
+        tolerance=1e-5,
+        source=None,
+        target=None,
+        weights=None,
+        downsample_plotting=False,
     ):
         """
         Initialize the ICP solver with maximum iterations and tolerance.
@@ -31,6 +37,7 @@ class ICPSolver(object):
         self.orig_source = source.copy() if source is not None else None
         self.target = target
         self.weights = weights
+        self.downsample_plotting = downsample_plotting
 
     def set_points_from_mesh(
         self, mesh: trimesh.Trimesh, num_points: int, cloud="source"
@@ -200,6 +207,7 @@ class ICPSolver(object):
                     total_matrix,
                     save_dir="results",
                     iteration=str(i).zfill(3),
+                    downsample=self.downsample_plotting,
                 )
                 break
             else:
@@ -213,12 +221,15 @@ class ICPSolver(object):
                     total_matrix,
                     save_dir="results",
                     iteration=str(i).zfill(3),
+                    downsample=self.downsample_plotting,
                 )
 
         return total_matrix, transformed, cost
 
     @staticmethod
-    def plot_transform(A, B, transform, save_dir="results", iteration="001"):
+    def plot_transform(
+        A, B, transform, save_dir="results", iteration="001", downsample=False
+    ):
         """
         Plot the original and transformed point clouds for visualization.
 
@@ -238,9 +249,10 @@ class ICPSolver(object):
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
 
-        A = ICPSolver.downsample_points(A, rate=0.05)
-        B = ICPSolver.downsample_points(B, rate=0.05)
-        A_transformed = ICPSolver.downsample_points(A_transformed, rate=0.05)
+        if downsample:
+            A = ICPSolver.downsample_points(A, rate=0.05)
+            B = ICPSolver.downsample_points(B, rate=0.05)
+            A_transformed = ICPSolver.downsample_points(A_transformed, rate=0.05)
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
