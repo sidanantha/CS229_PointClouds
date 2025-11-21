@@ -11,6 +11,7 @@ import trimesh
 from trimesh import util
 from scipy.spatial import cKDTree
 import pandas as pd
+import open3d as o3d
 
 
 class ICPSolver(object):
@@ -63,7 +64,7 @@ class ICPSolver(object):
         else:
             raise ValueError("cloud must be either 'source' or 'target'")
 
-    def set_points_from_csv(self, file_path: str, cloud="source"):
+    def set_points_from_csv(self, file_path: str, cloud="source", has_weights=True):
         """
         Load points from a CSV file. If cloud is "source", also load uncertainties as weights.
         Store points in the appropriate attribute.
@@ -74,12 +75,15 @@ class ICPSolver(object):
         The path to the CSV file.
         cloud : str
         Either "source" or "target" to specify which point cloud to load.
+        has_weights : bool
+        Whether to retrieve the weights from "uncertainty" column of csv
         """
         df = pd.read_csv(file_path)
         if cloud == "source":
             self.source = df[["x", "y", "z"]].to_numpy()
             self.orig_source = self.source.copy()
-            self.weights = df["uncertainty"].to_numpy()
+            if has_weights:
+                self.weights = df["uncertainty"].to_numpy()
         elif cloud == "target":
             self.target = df[["x", "y", "z"]].to_numpy()
         else:
@@ -87,6 +91,7 @@ class ICPSolver(object):
 
     def best_fit_transform(
         self,
+        closest,
         reflection: bool = True,
         translation: bool = True,
         scale: bool = True,
@@ -118,7 +123,7 @@ class ICPSolver(object):
         """
         matrix, transformed, cost = trimesh.registration.procrustes(
             self.source,
-            self.target,
+            closest,
             weights=self.weights,
             reflection=reflection,
             translation=translation,
@@ -139,8 +144,7 @@ class ICPSolver(object):
         Apply the iterative closest point algorithm to align a point cloud with
         another point cloud or mesh. Will only produce reasonable results if the
         initial transformation is roughly correct. Initial transformation can be
-        found by applying Procrustes' analysis to a suitable set of landmark
-        points (often picked manually).
+        found by RANSAC using extracted FPFH features.
 
         Parameters
         ----------
@@ -167,7 +171,8 @@ class ICPSolver(object):
             raise ValueError("points must be (n,3)!")
 
         if initial is None:
-            initial = np.eye(4)
+            initial = self.get_initial_transform_fpfh()
+            print(f"Estimated initial transform: {initial}")
 
         self.target = np.asanyarray(self.target, dtype=np.float64)
         if not util.is_shape(self.target, (-1, 3)):
@@ -188,13 +193,13 @@ class ICPSolver(object):
             closest = self.target[ix]
 
             # align a with closest points
-            matrix, transformed, cost = self.best_fit_transform(**kwargs)
+            matrix, transformed, cost = self.best_fit_transform(closest, **kwargs)
 
             # update a with our new transformed points
             self.source = transformed
             total_matrix = np.dot(matrix, total_matrix)
 
-            if old_cost - cost < self.tolerance:
+            if abs(old_cost - cost) < self.tolerance:
                 print(
                     f"Converged at iteration {i}, cost: {cost}, change: {old_cost - cost}"
                 )
@@ -225,6 +230,91 @@ class ICPSolver(object):
                 )
 
         return total_matrix, transformed, cost
+
+    def icp_sa(self, initial=None, plotting=False, **kwargs):
+        """ICP with simulated annealing approach to avoid local minima.
+        To be implemented."""
+        raise NotImplementedError
+
+    def get_initial_transform_fpfh(self):
+        """
+        Obtain initial transformation guess using FPFH feature extraction from open3d.
+
+        Returns
+        -------------------
+        transform: initial guess given src and tgt input to solver
+        """
+        src_pcd = o3d.geometry.PointCloud()
+        src_pcd.points = o3d.utility.Vector3dVector(self.source)
+        tgt_pcd = o3d.geometry.PointCloud()
+        tgt_pcd.points = o3d.utility.Vector3dVector(self.target)
+
+        src_down, src_fpfh = ICPSolver.extract_initial_features(src_pcd)
+        tgt_down, tgt_fpfh = ICPSolver.extract_initial_features(tgt_pcd)
+        transform = ICPSolver.execute_global_registration(
+            src_down, tgt_down, src_fpfh, tgt_fpfh
+        )
+        return transform
+
+    @staticmethod
+    def extract_initial_features(pcd: o3d.geometry.PointCloud, voxel_size=0.01):
+        """
+        Downsample point cloud and extract FPFH features for registration.
+
+        Args
+        --------------------
+        pcd: o3d.geometry PointCloud
+        voxel_size: 3D discretization size for downsampling
+
+        Returns
+        --------------------
+        pcd_down: downsampled o3d.geometry PointCloud (n,3)
+        pcd_fpfh: 33 features per point for registration (n,33)
+        """
+        pcd_down = pcd.voxel_down_sample(voxel_size)
+        radius_normal = voxel_size * 2
+        pcd_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
+        )
+        radius_feature = voxel_size * 5
+        pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pcd_down,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
+        )
+        return pcd_down, pcd_fpfh
+
+    @staticmethod
+    def execute_global_registration(
+        source_down, target_down, source_fpfh, target_fpfh, voxel_size=0.01
+    ):
+        """
+        RANSAC registration on downsampled point clouds using FPFH features.
+        Bascially a wrapper for the o3d function.
+
+        Args
+        ------------------
+        source_down: downsampled source o3d.geometry PointCloud (n,3)
+        target_down: downsampled target o3d.geometry PointCloud (m,3)
+        source_fpfh: 33 features per point for registration (n,33)
+        target_fpfh: 33 features per point for registration (m,33)
+        voxel_size: 3D discretization size used for previous downsampling
+
+        Returns
+        -----------------
+        transform: initial guess of transform for point cloud registration
+        """
+        distance_threshold = voxel_size * 1.5
+        result = (
+            o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                source_down,
+                target_down,
+                source_fpfh,
+                target_fpfh,
+                False,
+                distance_threshold,
+            )
+        )
+        return result.transformation
 
     @staticmethod
     def plot_transform(
@@ -268,6 +358,7 @@ class ICPSolver(object):
         )
         ax.legend()
         plt.savefig(os.path.join(save_dir, f"icp_transformation_{iteration}.png"))
+        plt.close(fig)
 
     @staticmethod
     def downsample_points(
