@@ -7,14 +7,14 @@ import torch
 from plyfile import PlyElement, PlyData
 
 
-def save_point_cloud_csv(points, uncertainty, output_path):
+def save_point_cloud_csv(points, output_path, uncertainty=None):
     """
     Save a point cloud to CSV format.
     
     Args:
         points: np.ndarray of shape (N, 3) - xyz coordinates
-        uncertainty: np.ndarray of shape (N,) - uncertainty values
         output_path: str, path to save the CSV file
+        uncertainty: np.ndarray of shape (N,) - uncertainty values (optional)
     
     Returns:
         None
@@ -28,10 +28,16 @@ def save_point_cloud_csv(points, uncertainty, output_path):
     with open(output_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         # Write header
-        writer.writerow(['x', 'y', 'z', 'uncertainty'])
+        if uncertainty is not None:
+            writer.writerow(['x', 'y', 'z', 'uncertainty'])
+        else:
+            writer.writerow(['x', 'y', 'z'])
         # Write data
         for i in range(len(points)):
-            writer.writerow([points[i, 0], points[i, 1], points[i, 2], uncertainty[i]])
+            if uncertainty is not None:
+                writer.writerow([points[i, 0], points[i, 1], points[i, 2], uncertainty[i]])
+            else:
+                writer.writerow([points[i, 0], points[i, 1], points[i, 2]])
     
     print(f"Point cloud saved to CSV: {output_path} with {len(points)} points")
 
