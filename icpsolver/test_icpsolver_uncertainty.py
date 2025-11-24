@@ -36,7 +36,7 @@ def test_icp_uncertainty():
     )
     print("Initialized ICPSolver.")
 
-    icp_solver.set_points_from_csv(src_path, cloud="source", has_weights=True)
+    icp_solver.set_points_from_csv(src_path, cloud="source", has_weights=False)
     icp_solver.set_points_from_csv(tgt_path, cloud="target")
     print("Loaded point clouds to solver")
 
@@ -45,6 +45,16 @@ def test_icp_uncertainty():
     print("ICP alignment completed.")
     print(f"Final transformation matrix:\n{matrix}")
     print(f"Final alignment cost: {cost}")
+
+    # # Try simulated annealing approach
+    # icp_solver.set_points_from_csv(src_path, cloud="source", has_weights=False)
+    # icp_solver.set_points_from_csv(tgt_path, cloud="target")
+    # matrix, transformed, energy = icp_solver.icp_sa(
+    #     reflection=False, scale=False, plotting=True
+    # )
+    # print("ICP with simulated annealing completed.")
+    # print(f"Final transformation matrix:\n{matrix}")
+    # print(f"Final energy: {energy}")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ from trimesh import util
 from scipy.spatial import cKDTree
 import pandas as pd
 import open3d as o3d
+from typing import Optional
+from scipy.spatial.transform import Rotation
 
 
 class ICPSolver(object):
@@ -24,9 +26,9 @@ class ICPSolver(object):
         self,
         max_iterations=20,
         tolerance=1e-5,
-        source=None,
-        target=None,
-        weights=None,
+        source: Optional[np.ndarray] = None,
+        target: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
         downsample_plotting=False,
     ):
         """
@@ -89,7 +91,7 @@ class ICPSolver(object):
         else:
             raise ValueError("cloud must be either 'source' or 'target'")
 
-    def best_fit_transform(
+    def _best_fit_transform(
         self,
         closest,
         reflection: bool = True,
@@ -193,7 +195,7 @@ class ICPSolver(object):
             closest = self.target[ix]
 
             # align a with closest points
-            matrix, transformed, cost = self.best_fit_transform(closest, **kwargs)
+            matrix, transformed, cost = self._best_fit_transform(closest, **kwargs)
 
             # update a with our new transformed points
             self.source = transformed
@@ -231,10 +233,249 @@ class ICPSolver(object):
 
         return total_matrix, transformed, cost
 
-    def icp_sa(self, initial=None, plotting=False, **kwargs):
-        """ICP with simulated annealing approach to avoid local minima.
-        To be implemented."""
-        raise NotImplementedError
+    def icp_sa(
+        self,
+        initial=None,
+        plotting=False,
+        sa_iterations=50,
+        initial_temp=1.0,
+        cooling_rate=0.95,
+        perturb_rotation_std=0.1,
+        perturb_translation_std=0.05,
+        local_icp_iterations=5,
+        **kwargs,
+    ):
+        """
+        ICP with simulated annealing approach to avoid local minima.
+
+        ** NOT SURE IF THIS WORKS YET NOT THOROUGHLY TESTED **
+
+        Parameters
+        ----------
+        initial : (4,4) float
+            Initial transformation matrix. If None, uses FPFH.
+        plotting : bool
+            Whether to generate plots during optimization.
+        sa_iterations : int
+            Number of simulated annealing iterations.
+        initial_temp : float
+            Starting temperature for simulated annealing.
+        cooling_rate : float
+            Temperature decay factor (0 < cooling_rate < 1).
+        perturb_rotation_std : float
+            Standard deviation for random rotation perturbations (radians).
+        perturb_translation_std : float
+            Standard deviation for random translation perturbations.
+        local_icp_iterations : int
+            Number of ICP iterations to run for local refinement.
+        **kwargs : dict
+            Additional arguments passed to best_fit_transform.
+
+        Returns
+        -------
+        best_matrix : (4,4) float
+            Best transformation matrix found.
+        best_transformed : (n,3) float
+            Source points under best transformation.
+        best_energy : float
+            Final alignment error (energy).
+        """
+
+        # Initialize
+        self.source = np.asanyarray(self.source, dtype=np.float64)
+        self.target = np.asanyarray(self.target, dtype=np.float64)
+
+        if initial is None:
+            # initial = self.get_initial_transform_fpfh()
+            # print(f"Estimated initial transform via FPFH")
+            initial = np.eye(4)
+
+        # Initialize simulated annealing
+        current_transform = initial.copy()
+        current_energy = self._compute_alignment_energy(current_transform)
+
+        best_transform = current_transform.copy()
+        best_energy = current_energy
+
+        temperature = initial_temp
+
+        print(f"Starting Simulated Annealing ICP")
+        print(f"Initial energy (RMSE): {current_energy:.6f}")
+        print(
+            f"SA iterations: {sa_iterations}, Initial temp: {initial_temp}, Cooling rate: {cooling_rate}"
+        )
+
+        # Simulated annealing loop
+        for iteration in range(sa_iterations):
+            # Perturb current transform
+            candidate_transform = ICPSolver.perturb_transform(
+                current_transform, perturb_rotation_std, perturb_translation_std
+            )
+
+            # Optional: Refine with local ICP
+            if local_icp_iterations > 0:
+                candidate_transform, _ = self._local_icp_refine(
+                    candidate_transform, local_icp_iterations, **kwargs
+                )
+
+            # Compute energy
+            candidate_energy = self._compute_alignment_energy(candidate_transform)
+
+            # Acceptance criterion
+            energy_delta = candidate_energy - current_energy
+
+            if energy_delta < 0:
+                # Always accept improvement
+                accept = True
+            else:
+                # Accept with probability exp(-delta/T)
+                acceptance_prob = np.exp(-energy_delta / temperature)
+                accept = np.random.rand() < acceptance_prob
+
+            # Update current state
+            if accept:
+                current_transform = candidate_transform.copy()
+                current_energy = candidate_energy
+
+                # Update best if this is the best so far
+                if current_energy < best_energy:
+                    best_transform = current_transform.copy()
+                    best_energy = current_energy
+                    print(
+                        f"Iteration {iteration}: New best energy: {best_energy:.6f} (T={temperature:.4f})"
+                    )
+
+            # Cool down
+            temperature *= cooling_rate
+
+            # Periodic reporting
+            if iteration % 10 == 0:
+                print(
+                    f"Iteration {iteration}: Current energy: {current_energy:.6f}, "
+                    f"Best energy: {best_energy:.6f}, Temp: {temperature:.4f}"
+                )
+
+            # Optional plotting
+            if plotting and (iteration % 10 == 0 or iteration == sa_iterations - 1):
+                self.plot_transform(
+                    self.orig_source,
+                    self.target,
+                    best_transform,
+                    save_dir="results_sa",
+                    iteration=f"sa_{str(iteration).zfill(3)}",
+                    downsample=self.downsample_plotting,
+                )
+
+        # Final refinement with full ICP
+        print(f"\nFinal refinement with standard ICP...")
+        self.source = self.orig_source.copy()  # type: ignore
+        final_transform, final_transformed, final_cost = self.icp(
+            initial=best_transform, plotting=plotting, **kwargs
+        )
+
+        final_energy = self._compute_alignment_energy(final_transform)
+        print(f"Final energy after full ICP refinement: {final_energy:.6f}")
+
+        return final_transform, final_transformed, final_energy
+
+    def _compute_alignment_energy(self, transform):
+        """
+        Compute alignment error (RMSE) for a given transform.
+
+        Parameters
+        ----------
+        transform : (4,4) float
+            Transformation matrix to evaluate.
+
+        Returns
+        -------
+        energy : float
+            RMSE of nearest-neighbor distances.
+        """
+        transformed = trimesh.registration.transform_points(self.orig_source, transform)
+        tree = cKDTree(self.target)  # type: ignore
+        distances, _ = tree.query(transformed, 1)
+        return np.sqrt(np.mean(distances**2))  # RMSE
+
+    def _local_icp_refine(self, T_init, max_iter, **kwargs):
+        """
+        Run local ICP refinement starting from T_init.
+
+        Parameters
+        ----------
+        T_init : (4,4) float
+            Initial transformation for refinement.
+        max_iter : int
+            Number of ICP iterations to run.
+        **kwargs : dict
+            Additional arguments passed to best_fit_transform.
+
+        Returns
+        -------
+        T_refined : (4,4) float
+            Refined transformation matrix.
+        cost : float
+            Final cost of refinement.
+        """
+        # Temporarily save current state
+        orig_max_iter = self.max_iterations
+        orig_source = self.source.copy()  # type: ignore
+
+        # Set up for local refinement
+        self.max_iterations = max_iter
+        self.source = self.orig_source.copy()  # type: ignore
+
+        # Run ICP
+        T_refined, _, cost = self.icp(initial=T_init, plotting=False, **kwargs)
+
+        # Restore state
+        self.max_iterations = orig_max_iter
+        self.source = orig_source
+
+        return T_refined, cost
+
+    @staticmethod
+    def perturb_transform(T, rot_std, trans_std):
+        """
+        Apply small random rotation and translation to transform T.
+
+        Parameters
+        ----------
+        T : (4,4) float
+            Input transformation matrix.
+        rot_std : float
+            Standard deviation for rotation perturbation (radians).
+        trans_std : float
+            Standard deviation for translation perturbation.
+
+        Returns
+        -------
+        T_new : (4,4) float
+            Perturbed transformation matrix.
+        """
+
+        # Extract current rotation and translation
+        R_current = T[:3, :3]
+        t_current = T[:3, 3]
+
+        # Generate random rotation perturbation (axis-angle)
+        random_axis = np.random.randn(3)
+        random_axis /= np.linalg.norm(random_axis)
+        random_angle = np.random.randn() * rot_std
+        delta_R = Rotation.from_rotvec(random_axis * random_angle).as_matrix()
+
+        # Generate random translation perturbation
+        delta_t = np.random.randn(3) * trans_std
+
+        # Apply perturbations
+        R_new = delta_R @ R_current
+        t_new = t_current + delta_t
+
+        # Construct new transform
+        T_new = np.eye(4)
+        T_new[:3, :3] = R_new
+        T_new[:3, 3] = t_new
+        return T_new
 
     def get_initial_transform_fpfh(self):
         """
@@ -255,6 +496,143 @@ class ICPSolver(object):
             src_down, tgt_down, src_fpfh, tgt_fpfh
         )
         return transform
+
+    def plot_transform(
+        self, A, B, transform, save_dir="results", iteration="001", downsample=False
+    ):
+        """
+        Plot the original and transformed point clouds for visualization.
+        Colors/alpha based on weights if available.
+
+        Parameters
+        ----------
+        A : (n,3) float
+            List of points in space (source).
+        B : (m,3) float
+            List of points in space (target).
+        transform : (4,4) float
+            Transformation matrix to apply to A.
+        save_dir : str
+            Directory to save plots.
+        iteration : str
+            Iteration identifier for filename.
+        downsample : bool
+            Whether to downsample for plotting.
+        """
+        A_transformed = trimesh.registration.transform_points(A, transform)
+
+        file_dir = os.path.dirname(__file__)
+        save_dir = os.path.join(file_dir, save_dir)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # Handle weights for coloring/alpha
+        weights = self.weights
+        if weights is not None and len(weights) == len(A):
+            weights_copy = weights.copy()
+        else:
+            weights_copy = None
+
+        if downsample:
+            # Downsample and keep corresponding weights
+            indices = np.random.choice(
+                A.shape[0], int(A.shape[0] * 0.05), replace=False
+            )
+            A = A[indices]
+            B = ICPSolver.downsample_points(B, rate=0.05)
+            A_transformed = A_transformed[indices]
+            if weights_copy is not None:
+                weights_copy = weights_copy[indices]
+
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Plot target (always red, fixed alpha)
+        ax.scatter(
+            B[:, 0], B[:, 1], B[:, 2], c="r", label="Target (B)", alpha=0.2, s=20
+        )
+
+        if weights_copy is not None:
+            # Normalize weights to [0, 1] for alpha calculation
+            # Higher weight = more certain = more opaque
+            weights_norm = (weights_copy - weights_copy.min()) / (
+                weights_copy.max() - weights_copy.min() + 1e-10
+            )
+
+            # Higher weight (certainty) = higher alpha (more opaque)
+            alphas = 0.1 + 0.7 * weights_norm  # Scale to [0.1, 0.8] range
+
+            # Plot source with weight-based alpha (blue)
+            for i in range(len(A)):
+                ax.scatter(A[i, 0], A[i, 1], A[i, 2], c="b", alpha=alphas[i], s=20)
+
+            # Plot transformed source with weight-based alpha (green)
+            for i in range(len(A_transformed)):
+                ax.scatter(
+                    A_transformed[i, 0],
+                    A_transformed[i, 1],
+                    A_transformed[i, 2],
+                    c="g",
+                    alpha=alphas[i],
+                    s=20,
+                )
+
+            # Manual legend entries (since we plotted individual points)
+            from matplotlib.lines import Line2D
+
+            legend_elements = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="r",
+                    markersize=8,
+                    alpha=0.2,
+                    label="Target (B)",
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="b",
+                    markersize=8,
+                    alpha=0.5,
+                    label="Source (A) - alpha by certainty",
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="g",
+                    markersize=8,
+                    alpha=0.5,
+                    label="Transformed Source (A) - alpha by certainty",
+                ),
+            ]
+            ax.legend(handles=legend_elements)
+        else:
+            # No weights available, use original plotting
+            ax.scatter(A[:, 0], A[:, 1], A[:, 2], c="b", label="Source (A)", alpha=0.2)
+            ax.scatter(
+                A_transformed[:, 0],
+                A_transformed[:, 1],
+                A_transformed[:, 2],
+                c="g",
+                label="Transformed Source (A)",
+                alpha=0.5,
+            )
+            ax.legend()
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        plt.savefig(
+            os.path.join(save_dir, f"icp_transformation_{iteration}.png"), dpi=150
+        )
+        plt.close(fig)
 
     @staticmethod
     def extract_initial_features(pcd: o3d.geometry.PointCloud, voxel_size=0.01):
@@ -315,50 +693,6 @@ class ICPSolver(object):
             )
         )
         return result.transformation
-
-    @staticmethod
-    def plot_transform(
-        A, B, transform, save_dir="results", iteration="001", downsample=False
-    ):
-        """
-        Plot the original and transformed point clouds for visualization.
-
-        Parameters
-        ----------
-        A : (n,3) float
-        List of points in space (source).
-        B : (m,3) float
-        List of points in space (target).
-        transform : (4,4) float
-        Transformation matrix to apply to A.
-        """
-        A_transformed = trimesh.registration.transform_points(A, transform)
-
-        file_dir = os.path.dirname(__file__)
-        save_dir = os.path.join(file_dir, save_dir)
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
-        if downsample:
-            A = ICPSolver.downsample_points(A, rate=0.05)
-            B = ICPSolver.downsample_points(B, rate=0.05)
-            A_transformed = ICPSolver.downsample_points(A_transformed, rate=0.05)
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(B[:, 0], B[:, 1], B[:, 2], c="r", label="Target (B)", alpha=0.2)
-        ax.scatter(A[:, 0], A[:, 1], A[:, 2], c="b", label="Source (A)", alpha=0.2)
-        ax.scatter(
-            A_transformed[:, 0],
-            A_transformed[:, 1],
-            A_transformed[:, 2],
-            c="g",
-            label="Transformed Source (A)",
-            alpha=0.5,
-        )
-        ax.legend()
-        plt.savefig(os.path.join(save_dir, f"icp_transformation_{iteration}.png"))
-        plt.close(fig)
 
     @staticmethod
     def downsample_points(

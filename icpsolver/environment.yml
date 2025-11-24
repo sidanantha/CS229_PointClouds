@@ -2,7 +2,7 @@ name: cs229-proj
 channels:
   - conda-forge
 dependencies:
-  - python=3.9
+  - python=3.10
   - trimesh=4.0.4
   - numpy=1.23.5
   - py-opencv=4.5.5
@@ -11,3 +11,4 @@ dependencies:
   - matplotlib=3.5.1
   - scikit-image=0.19.2
   - imgaug=0.4.0
+  - pytorch
