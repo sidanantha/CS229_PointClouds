@@ -34,7 +34,7 @@ from Trajectory_Selection.NBVS_Utils import generate_chief_surface_points
 from Trajectory_Selection.NBVS_FisherRF_Integration import run_fisherrf_training, load_fisherrf_model
 from scene.cameras import Camera
 from gaussian_splatting.scene.dynamic_camera_loader import DynamicCameraLoader
-from FisherRF_Fresh.FisherRF.render_uncertainty import get_point_cloud_from_view
+from FisherRF_Fresh.FisherRF.render_uncertainty import get_point_cloud_from_view, render_set_current_with_output_path
 from Trajectory_Selection.Trajectory_Candidates import prototype_candidates
 from Trajectory_Selection.Build_View import render_image
 
@@ -276,6 +276,9 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
             'point_clouds': []
         }
         
+        # List to store cameras for heat map rendering
+        test_cameras = []
+        
         # Loop through time steps
         for tau_idx in range(actual_tau_steps):
             tau_value = tau_idx * tau_time_step
@@ -345,6 +348,9 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
                 data_device="cuda"
             )
             
+            # Add camera to list for heat map rendering
+            test_cameras.append(camera)
+            
             # === Render 3DGS image ===
             gs_output_dir = os.path.join(output_base_dir, "3DGS_Renderer", str(candidate_idx))
             os.makedirs(gs_output_dir, exist_ok=True)
@@ -388,6 +394,21 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
             if (tau_idx + 1) % 10 == 0:
                 print(f"  ✓ Processed {tau_idx + 1}/{actual_tau_steps} viewpoints")
         
+        # Render uncertainty heat maps for all cameras after the tau loop
+        if len(test_cameras) > 0:
+            output_dir = os.path.join(output_base_dir, "3DGS_Uncertainty_Heatmap", str(candidate_idx))
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"Rendering uncertainty heat maps for candidate {candidate_idx} with {len(test_cameras)} cameras...")
+            render_set_current_with_output_path(
+                output_path=output_dir,  # Save to 3DGS_Uncertainty_Heatmap/<candidate_idx>/
+                test_views=test_cameras,  # List of Camera objects
+                gaussians=gaussians,
+                pipeline=pipeline,
+                background=background,
+                args=None
+            )
+            print(f"Rendered uncertainty heat maps for candidate {candidate_idx}")
+        
         dataset_info.append(generated_files)
         print(f"✓ Candidate {candidate_idx} complete: Generated {actual_tau_steps} point clouds")
     
@@ -399,6 +420,8 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
     print(f"Base output directory: {output_base_dir}")
     print(f"  - Point clouds: {output_base_dir}/3DGS_PC/")
     print(f"  - Rendered images: {output_base_dir}/GT_Renderer/")
+    print(f"  - 3DGS renders: {output_base_dir}/3DGS_Renderer/")
+    print(f"  - Uncertainty heatmaps: {output_base_dir}/3DGS_Uncertainty_Heatmap/")
     print("=" * 80)
     
     return dataset_info
