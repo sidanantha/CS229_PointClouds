@@ -96,6 +96,28 @@ def load_or_train_model(P1, P2_list, force_retrain=False, model_path="neural_net
     return model
 
 
+def load_model(model_path="neural_network/models/correspondance_net.pth"):
+    """
+    Load a trained model from a file path.
+    
+    Args:
+        model_path: Path to the saved model file
+    
+    Returns:
+        model: Loaded CorrespondanceNet model
+    
+    Example:
+        model = load_model("neural_network/models/correspondance_net.pth")
+        correspondances, probabilities, virtual_Q = compute_virtual_point_cloud(model, P, Q)
+    """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found at {model_path}")
+    
+    print(f"Loading model from: {model_path}")
+    model = CorrespondanceNet.from_checkpoint(model_path)
+    return model
+
+
 def compute_virtual_point_cloud(model, P, Q):
     """
     Given a trained model, source point cloud P, and target point cloud Q,
