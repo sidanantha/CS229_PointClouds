@@ -48,6 +48,12 @@ def compute_svd_transform(X, Y_hat):
         R: (3, 3) rotation matrix
         t: (3,) translation vector
     """
+    if not torch.isfinite(X).all():
+        raise ValueError("Non-finite values in X")
+
+    if not torch.isfinite(Y_hat).all():
+        raise ValueError("Non-finite values in Y_hat")
+
     # Center the point clouds
     X_mean = X.mean(dim=0, keepdim=True)  # (1, 3)
     Y_hat_mean = Y_hat.mean(dim=0, keepdim=True)  # (1, 3)
@@ -57,6 +63,12 @@ def compute_svd_transform(X, Y_hat):
 
     # Compute cross-covariance matrix
     H = X_centered.T @ Y_hat_centered  # (3, 3)
+
+    if not torch.isfinite(H).all():
+        print("X:", X[:5])
+        print("Y_hat:", Y_hat[:5])
+        print("H:", H)
+        raise ValueError("Non-finite values in cross-covariance matrix H")
 
     # SVD decomposition
     U, S, Vt = torch.linalg.svd(H)

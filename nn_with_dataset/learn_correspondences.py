@@ -7,8 +7,8 @@ import argparse
 import random
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from tqdm import tqdm
 from torch.utils.data import DataLoader, Subset
+from torch.nn.utils import clip_grad_norm_
 
 import utils
 from CorrespondanceNet import CorrespondanceNet
@@ -69,7 +69,7 @@ def load_or_train_model(
     force_retrain=False,
     model_path="neural_network/models/correspondance_net.pth",
     epochs=100,
-    lr=0.01,
+    lr=0.001,
     use_dcp_loss=True,
     lambda_reg=0.001,
 ):
@@ -118,6 +118,13 @@ def load_or_train_model(
         train_rot_losses = []
         train_trans_losses = []
 
+        val_losses_total = []
+        val_rot_losses = []
+        val_trans_losses = []
+
+        total_batches = len(train_loader)
+        print_every = max(1, total_batches // 10)  # Print ~10 times per epoch
+
         for epoch in range(epochs):
             model.train()
             epoch_loss = 0.0
@@ -125,9 +132,9 @@ def load_or_train_model(
             epoch_trans_loss = 0.0
             num_batches = 0
 
-            for batch_idx, batch in enumerate(
-                tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-            ):
+            print(f"\nEpoch {epoch+1}/{epochs}")
+
+            for batch_idx, batch in enumerate(train_loader):
                 X_batch = batch["source"]  # list of (N_i, 3) tensors
                 Y_batch = batch["target"]  # list of (M_i, 3) tensors
                 T_gt_batch = batch["transform"]  # (batch_size, 4, 4) stacked tensor
@@ -178,6 +185,7 @@ def load_or_train_model(
                 # Backward pass
                 optimizer.zero_grad()
                 batch_loss.backward()
+                clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 epoch_loss += batch_loss.item()
@@ -185,6 +193,26 @@ def load_or_train_model(
                     epoch_rot_loss += batch_rot_loss / len(X_batch)
                     epoch_trans_loss += batch_trans_loss / len(X_batch)
                 num_batches += 1
+
+                # Print progress every few batches
+                if (batch_idx + 1) % print_every == 0 or (
+                    batch_idx + 1
+                ) == total_batches:
+                    avg_loss_so_far = epoch_loss / num_batches
+                    if use_dcp_loss:
+                        avg_rot_so_far = epoch_rot_loss / num_batches
+                        avg_trans_so_far = epoch_trans_loss / num_batches
+                        print(
+                            f"  Batch [{batch_idx+1}/{total_batches}] - "
+                            f"Loss: {avg_loss_so_far:.6f}, "
+                            f"Rot: {avg_rot_so_far:.6f}, "
+                            f"Trans: {avg_trans_so_far:.6f}"
+                        )
+                    else:
+                        print(
+                            f"  Batch [{batch_idx+1}/{total_batches}] - "
+                            f"Loss: {avg_loss_so_far:.6f}"
+                        )
 
             avg_epoch_loss = epoch_loss / num_batches
             train_losses.append(avg_epoch_loss)
@@ -195,22 +223,24 @@ def load_or_train_model(
                 train_rot_losses.append(avg_rot_loss)
                 train_trans_losses.append(avg_trans_loss)
 
-            if (epoch + 1) % 10 == 0:
-                if use_dcp_loss:
-                    print(
-                        f"Epoch {epoch+1}/{epochs}, Total Loss: {avg_epoch_loss:.6f}, "
-                        f"Rot: {avg_rot_loss:.6f}, Trans: {avg_trans_loss:.6f}"
-                    )
-                else:
-                    print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_epoch_loss:.6f}")
+            # Print epoch summary
+            if use_dcp_loss:
+                print(
+                    f"Epoch {epoch+1}/{epochs} Complete - Total Loss: {avg_epoch_loss:.6f}, "
+                    f"Rot: {avg_rot_loss:.6f}, Trans: {avg_trans_loss:.6f}"
+                )
+            else:
+                print(f"Epoch {epoch+1}/{epochs} Complete - Loss: {avg_epoch_loss:.6f}")
 
             # Validation (optional)
-            if val_loader is not None and (epoch + 1) % 10 == 0:
+            if val_loader is not None:
                 model.eval()
                 val_loss = torch.tensor(0.0)
                 val_rot_loss = 0.0
                 val_trans_loss = 0.0
                 val_batches = 0
+
+                print("  Running validation...")
 
                 with torch.no_grad():
                     for batch in val_loader:
@@ -262,6 +292,68 @@ def load_or_train_model(
                 else:
                     print(f"  Validation Loss: {avg_val_loss:.6f}")
 
+                val_losses_total.append(avg_val_loss)
+                if use_dcp_loss:
+                    val_rot_losses.append(avg_val_rot)
+                    val_trans_losses.append(avg_val_trans)
+
+            # ---- Save per-epoch plots ----
+            os.makedirs("loss_plots", exist_ok=True)
+            fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+
+            epochs_range = range(1, len(train_losses) + 1)
+
+            # --- Total Loss ---
+            axes[0].plot(epochs_range, train_losses, label="Train Total", linewidth=2)
+            if val_loader is not None:
+                axes[0].plot(
+                    epochs_range, val_losses_total, label="Val Total", linestyle="--"
+                )
+            axes[0].set_title("Total Loss")
+            axes[0].set_xlabel("Epoch")
+            axes[0].set_ylabel("Loss")
+            axes[0].grid(True, alpha=0.3)
+            axes[0].legend()
+
+            # --- Rotation Loss ---
+            if use_dcp_loss:
+                axes[1].plot(
+                    epochs_range, train_rot_losses, label="Train Rot", linewidth=2
+                )
+                if val_loader is not None:
+                    axes[1].plot(
+                        epochs_range, val_rot_losses, label="Val Rot", linestyle="--"
+                    )
+                axes[1].set_title("Rotation Loss")
+                axes[1].set_xlabel("Epoch")
+                axes[1].grid(True, alpha=0.3)
+                axes[1].legend()
+            else:
+                axes[1].axis("off")  # No rotation loss when using MSE
+
+            # --- Translation Loss ---
+            if use_dcp_loss:
+                axes[2].plot(
+                    epochs_range, train_trans_losses, label="Train Trans", linewidth=2
+                )
+                if val_loader is not None:
+                    axes[2].plot(
+                        epochs_range,
+                        val_trans_losses,
+                        label="Val Trans",
+                        linestyle="--",
+                    )
+                axes[2].set_title("Translation Loss")
+                axes[2].set_xlabel("Epoch")
+                axes[2].grid(True, alpha=0.3)
+                axes[2].legend()
+            else:
+                axes[2].axis("off")
+
+            plt.tight_layout()
+            plt.savefig(f"loss_plots/loss_epoch_{epoch+1}.png")
+            plt.close()
+
         # Save the trained model
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         model.save_model(model_path)
@@ -306,7 +398,7 @@ def load_or_train_model(
             plt.close()
 
         print(
-            f"Training curve saved to {model_path.replace('.pth', '_training_curve.png')}"
+            f"\nTraining curve saved to {model_path.replace('.pth', '_training_curve.png')}"
         )
 
         # Set to evaluation mode for inference
@@ -607,24 +699,6 @@ def plot_point_clouds(
     ax = axes[1]
     ax.scatter(P1[:, 0], P1[:, 2], c="blue", alpha=0.5, s=10, label="P1 (Source)")
     ax.scatter(P2[:, 0], P2[:, 2], c="red", alpha=0.3, s=10, label="P2 (Target)")
-    ax.scatter(
-        virtual_point_cloud[:, 0],
-        virtual_point_cloud[:, 2],
-        c="green",
-        alpha=0.8,
-        s=20,
-        label="Virtual",
-    )
-    ax.set_xlabel("X")
-    ax.set_ylabel("Z")
-    ax.set_title("X-Z Plane (Front View)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # Y-Z plane
-    ax = axes[2]
-    ax.scatter(P1[:, 1], P1[:, 2], c="blue", alpha=0.5, s=10, label="P1 (Source)")
-    ax.scatter(P2[:, 1], P2[:, 2], c="red", alpha=0.3, s=10, label="P2 (Target)")
     ax.scatter(
         virtual_point_cloud[:, 1],
         virtual_point_cloud[:, 2],
