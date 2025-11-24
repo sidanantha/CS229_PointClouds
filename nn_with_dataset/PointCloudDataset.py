@@ -101,6 +101,14 @@ class PointCloudDataset(Dataset):
             tgt_path, dtype=np.float64, delimiter=",", skip_header=1, usecols=[0, 1, 2]
         )
 
+        # Downsample depthanything target point cloud if needed
+        rate = tgt.shape[0] / src.shape[0]
+        if rate > 10:
+            indices = np.random.choice(
+                tgt.shape[0], int(tgt.shape[0] / 10), replace=False
+            )
+            tgt = tgt[indices]
+
         src = torch.tensor(src, dtype=torch.float32)
         tgt = torch.tensor(tgt, dtype=torch.float32)
 

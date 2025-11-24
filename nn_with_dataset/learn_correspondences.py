@@ -1,5 +1,9 @@
 # learn_correspondances.py
 
+# Current issues: incorrectly assuming that the transform between the source and target pt
+# clouds can only be attributed to the applied perturbation. The clouds are not
+# aligned by default.
+
 import numpy as np
 import torch
 import os
@@ -67,7 +71,7 @@ def load_or_train_model(
     train_loader,
     val_loader=None,
     force_retrain=False,
-    model_path="neural_network/models/correspondance_net.pth",
+    model_path="output/correspondance_net.pth",
     epochs=100,
     lr=0.001,
     use_dcp_loss=True,
@@ -112,7 +116,7 @@ def load_or_train_model(
             f"Training the CorrespondanceNet for {epochs} epochs using {loss_type} loss..."
         )
         if use_dcp_loss:
-            print(f"  Regularization lambda: {lambda_reg}")
+            print(f"Regularization lambda: {lambda_reg}")
 
         train_losses = []
         train_rot_losses = []
@@ -203,14 +207,14 @@ def load_or_train_model(
                         avg_rot_so_far = epoch_rot_loss / num_batches
                         avg_trans_so_far = epoch_trans_loss / num_batches
                         print(
-                            f"  Batch [{batch_idx+1}/{total_batches}] - "
+                            f"Batch [{batch_idx+1}/{total_batches}] - "
                             f"Loss: {avg_loss_so_far:.6f}, "
                             f"Rot: {avg_rot_so_far:.6f}, "
                             f"Trans: {avg_trans_so_far:.6f}"
                         )
                     else:
                         print(
-                            f"  Batch [{batch_idx+1}/{total_batches}] - "
+                            f"Batch [{batch_idx+1}/{total_batches}] - "
                             f"Loss: {avg_loss_so_far:.6f}"
                         )
 
@@ -240,7 +244,7 @@ def load_or_train_model(
                 val_trans_loss = 0.0
                 val_batches = 0
 
-                print("  Running validation...")
+                print("Running validation...")
 
                 with torch.no_grad():
                     for batch in val_loader:
@@ -286,7 +290,7 @@ def load_or_train_model(
                     avg_val_rot = val_rot_loss / val_batches
                     avg_val_trans = val_trans_loss / val_batches
                     print(
-                        f"  Validation - Total: {avg_val_loss:.6f}, "
+                        f"Validation - Total: {avg_val_loss:.6f}, "
                         f"Rot: {avg_val_rot:.6f}, Trans: {avg_val_trans:.6f}"
                     )
                 else:
@@ -298,108 +302,88 @@ def load_or_train_model(
                     val_trans_losses.append(avg_val_trans)
 
             # ---- Save per-epoch plots ----
-            os.makedirs("loss_plots", exist_ok=True)
-            fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+            # Save per-epoch loss plots and concise diagnostics (moved to helper)
+            save_loss_plots(
+                train_losses,
+                train_rot_losses,
+                train_trans_losses,
+                val_losses_total,
+                val_rot_losses,
+                val_trans_losses,
+                epoch=epoch + 1,
+                use_dcp=use_dcp_loss,
+            )
 
-            epochs_range = range(1, len(train_losses) + 1)
+            # Save checkpoint and epoch diagnostics (probabilities, example mapping)
+            epoch_dir = os.path.join(os.path.dirname(model_path), f"epoch_{epoch+1}")
+            os.makedirs(epoch_dir, exist_ok=True)
 
-            # --- Total Loss ---
-            axes[0].plot(epochs_range, train_losses, label="Train Total", linewidth=2)
-            if val_loader is not None:
-                axes[0].plot(
-                    epochs_range, val_losses_total, label="Val Total", linestyle="--"
-                )
-            axes[0].set_title("Total Loss")
-            axes[0].set_xlabel("Epoch")
-            axes[0].set_ylabel("Loss")
-            axes[0].grid(True, alpha=0.3)
-            axes[0].legend()
+            # Save model checkpoint for this epoch
+            checkpoint_path = os.path.join(epoch_dir, os.path.basename(model_path))
+            model.save_model(checkpoint_path)
 
-            # --- Rotation Loss ---
-            if use_dcp_loss:
-                axes[1].plot(
-                    epochs_range, train_rot_losses, label="Train Rot", linewidth=2
-                )
+            # If validation loader available, pick first sample for diagnostics; otherwise use a train sample
+            try:
+                sample_batch = None
                 if val_loader is not None:
-                    axes[1].plot(
-                        epochs_range, val_rot_losses, label="Val Rot", linestyle="--"
-                    )
-                axes[1].set_title("Rotation Loss")
-                axes[1].set_xlabel("Epoch")
-                axes[1].grid(True, alpha=0.3)
-                axes[1].legend()
-            else:
-                axes[1].axis("off")  # No rotation loss when using MSE
+                    sample_batch = next(iter(val_loader))
+                else:
+                    sample_batch = next(iter(train_loader))
 
-            # --- Translation Loss ---
-            if use_dcp_loss:
-                axes[2].plot(
-                    epochs_range, train_trans_losses, label="Train Trans", linewidth=2
+                # unpack first sample in the batch
+                X_batch = sample_batch["source"]
+                Y_batch = sample_batch["target"]
+
+                if len(X_batch) > 0:
+                    P = X_batch[0].cpu()
+                    Q = Y_batch[0].cpu()
+
+                    # Compute probabilities / correspondences and virtual cloud
+                    with torch.no_grad():
+                        correspondances, probabilities, virtual_Q = (
+                            compute_virtual_point_cloud(model, P.numpy(), Q.numpy())
+                        )
+
+                    # Save raw CSVs for this epoch
+                    np.savetxt(
+                        os.path.join(epoch_dir, "correspondances.csv"),
+                        correspondances,
+                        delimiter=",",
+                    )
+                    np.savetxt(
+                        os.path.join(epoch_dir, "probabilities.csv"),
+                        probabilities,
+                        delimiter=",",
+                    )
+
+                    # Save visualizations for this epoch
+                    visualize_probabilities(
+                        probabilities,
+                        num_points=min(8, probabilities.shape[0]),
+                        save_path=os.path.join(
+                            epoch_dir, "probability_visualization.png"
+                        ),
+                    )
+
+                    plot_point_clouds(
+                        P.numpy(),
+                        Q.numpy(),
+                        virtual_Q,
+                        save_path=os.path.join(
+                            epoch_dir, "point_cloud_visualization.png"
+                        ),
+                    )
+                    print(f"Epoch {epoch+1}: Saved diagnostics to {epoch_dir}")
+            except StopIteration:
+                print(
+                    "Epoch diagnostics: dataset iterator empty; skipping example diagnostics"
                 )
-                if val_loader is not None:
-                    axes[2].plot(
-                        epochs_range,
-                        val_trans_losses,
-                        label="Val Trans",
-                        linestyle="--",
-                    )
-                axes[2].set_title("Translation Loss")
-                axes[2].set_xlabel("Epoch")
-                axes[2].grid(True, alpha=0.3)
-                axes[2].legend()
-            else:
-                axes[2].axis("off")
-
-            plt.tight_layout()
-            plt.savefig(f"loss_plots/loss_epoch_{epoch+1}.png")
-            plt.close()
+            except Exception as e:
+                print(f"Epoch diagnostics failed: {e}")
 
         # Save the trained model
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         model.save_model(model_path)
-
-        # Plot training curve
-        if use_dcp_loss and train_rot_losses:
-            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-            axes[0].plot(train_losses, label="Total Loss", color="blue")
-            axes[0].set_xlabel("Epoch")
-            axes[0].set_ylabel("Loss")
-            axes[0].set_title("Total Training Loss")
-            axes[0].legend()
-            axes[0].grid(True, alpha=0.3)
-
-            axes[1].plot(train_rot_losses, label="Rotation Loss", color="red")
-            axes[1].set_xlabel("Epoch")
-            axes[1].set_ylabel("Loss")
-            axes[1].set_title("Rotation Loss")
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-
-            axes[2].plot(train_trans_losses, label="Translation Loss", color="green")
-            axes[2].set_xlabel("Epoch")
-            axes[2].set_ylabel("Loss")
-            axes[2].set_title("Translation Loss")
-            axes[2].legend()
-            axes[2].grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.savefig(model_path.replace(".pth", "_training_curve.png"))
-            plt.close()
-        else:
-            plt.figure(figsize=(10, 6))
-            plt.plot(train_losses, label="Training Loss")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.title("Training Loss Curve")
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.savefig(model_path.replace(".pth", "_training_curve.png"))
-            plt.close()
-
-        print(
-            f"\nTraining curve saved to {model_path.replace('.pth', '_training_curve.png')}"
-        )
 
         # Set to evaluation mode for inference
         model.eval()
@@ -407,7 +391,7 @@ def load_or_train_model(
     return model
 
 
-def load_model(model_path="neural_network/models/correspondance_net.pth"):
+def load_model(model_path="models/correspondance_net.pth"):
     """
     Load a trained model from a file path.
 
@@ -466,6 +450,78 @@ def compute_virtual_point_cloud(model, P, Q):
         probabilities.detach().numpy(),
         virtual_Q.detach().numpy(),
     )
+
+
+def save_loss_plots(
+    train_losses,
+    train_rot_losses,
+    train_trans_losses,
+    val_losses_total,
+    val_rot_losses,
+    val_trans_losses,
+    epoch,
+    use_dcp=True,
+    out_dir="loss_plots",
+):
+    """Save per-epoch loss plots (total, rotation, translation).
+
+    Args:
+        train_losses: list of total train losses per epoch
+        train_rot_losses: list of rotation train losses per epoch
+        train_trans_losses: list of translation train losses per epoch
+        val_losses_total: list of val total losses per epoch
+        val_rot_losses: list of val rotation losses per epoch
+        val_trans_losses: list of val translation losses per epoch
+        epoch: current epoch number (1-indexed)
+        use_dcp: whether DCP loss is used (controls which plots to show)
+        out_dir: output directory for saving plots
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+
+    epochs_range = range(1, len(train_losses) + 1)
+
+    # Total Loss
+    axes[0].plot(epochs_range, train_losses, label="Train Total", linewidth=2)
+    if val_losses_total:
+        axes[0].plot(epochs_range, val_losses_total, label="Val Total", linestyle="--")
+    axes[0].set_title("Total Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    # Rotation Loss
+    if use_dcp:
+        axes[1].plot(epochs_range, train_rot_losses, label="Train Rot", linewidth=2)
+        if val_rot_losses:
+            axes[1].plot(epochs_range, val_rot_losses, label="Val Rot", linestyle="--")
+        axes[1].set_title("Rotation Loss")
+        axes[1].set_xlabel("Epoch")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+    else:
+        axes[1].axis("off")
+
+    # Translation Loss
+    if use_dcp:
+        axes[2].plot(epochs_range, train_trans_losses, label="Train Trans", linewidth=2)
+        if val_trans_losses:
+            axes[2].plot(
+                epochs_range, val_trans_losses, label="Val Trans", linestyle="--"
+            )
+        axes[2].set_title("Translation Loss")
+        axes[2].set_xlabel("Epoch")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+    else:
+        axes[2].axis("off")
+
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"loss_epoch_{epoch}.png")
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved loss plots to: {out_path}")
 
 
 def visualize_probabilities(
@@ -720,6 +776,67 @@ def plot_point_clouds(
     plt.close()
 
 
+def plot_gt_alignment(P1, P2, T_gt, save_path="results/gt_alignment.png"):
+    """Plot source (P1), target (P2), and source transformed by ground-truth T_gt.
+
+    Args:
+        P1: (N,3) numpy array or torch tensor of source points
+        P2: (M,3) numpy array or torch tensor of target points
+        T_gt: (4,4) numpy array or torch tensor representing homogeneous transform from P1->P2
+        save_path: path to save the figure
+    """
+    # Convert to numpy
+    if not isinstance(P1, np.ndarray):
+        P1 = P1.cpu().numpy()
+    if not isinstance(P2, np.ndarray):
+        P2 = P2.cpu().numpy()
+    if not isinstance(T_gt, np.ndarray):
+        T_gt = T_gt.copy()
+        try:
+            T_gt = T_gt.cpu().numpy()
+        except Exception:
+            # already numpy-like
+            pass
+
+    # Compute transformed source using homogeneous coords
+    R = T_gt[:3, :3]
+    t = T_gt[:3, 3]
+    P1_trans = (R @ P1.T).T + t.reshape(1, 3)
+
+    # Sanitize
+    P1_trans = np.nan_to_num(P1_trans, nan=0.0, posinf=0.0, neginf=0.0)
+
+    fig = plt.figure(figsize=(12, 4))
+
+    ax1 = fig.add_subplot(131, projection="3d")
+    ax1.scatter(P1[:, 0], P1[:, 1], P1[:, 2], c="blue", s=20, alpha=0.7)
+    ax1.set_title("Source (P1)")
+
+    ax2 = fig.add_subplot(132, projection="3d")
+    ax2.scatter(P2[:, 0], P2[:, 1], P2[:, 2], c="red", s=20, alpha=0.7)
+    ax2.set_title("Target (P2)")
+
+    ax3 = fig.add_subplot(133, projection="3d")
+    ax3.scatter(P2[:, 0], P2[:, 1], P2[:, 2], c="red", s=12, alpha=0.5, label="Target")
+    ax3.scatter(
+        P1_trans[:, 0],
+        P1_trans[:, 1],
+        P1_trans[:, 2],
+        c="green",
+        s=20,
+        alpha=0.8,
+        label="P1 transformed by GT",
+    )
+    ax3.set_title("P1 transformed (GT) vs P2")
+    ax3.legend()
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved GT alignment figure to: {save_path}")
+    plt.close()
+
+
 def run_training_and_visualization(
     dataset_dir,
     force_retrain=False,
@@ -773,6 +890,29 @@ def run_training_and_visualization(
         collate_fn=utils.collate_fn,
     )
 
+    # Plot a few example source/target pairs and source transformed by GT
+    try:
+        example_dir = "output/examples"
+        os.makedirs(example_dir, exist_ok=True)
+
+        # Pick up to 3 validation samples (or train samples if val empty)
+        sample_indices = val_indices if len(val_indices) > 0 else train_indices
+        num_examples = min(20, len(sample_indices))
+        for i in range(num_examples):
+            sample = full_dataset[sample_indices[i]]
+            P = sample["source"].numpy()
+            Q = sample["target"].numpy()
+            T = sample["transform"].numpy()
+            savep = os.path.join(example_dir, f"example_{i+1}_gt_alignment.png")
+            plot_gt_alignment(P, Q, T, savep)
+        print(
+            f"Saved {num_examples} example GT-alignment visualizations to {example_dir}"
+        )
+    except Exception as e:
+        print(f"Failed to create example GT-alignment visualizations: {e}")
+
+    # After we create the dataloaders, plot some examples of source/target pairs and source transformed by GT onto target
+
     # Load or train model
     print("\n=== Loading/Training Model ===")
     model = load_or_train_model(
@@ -782,69 +922,6 @@ def run_training_and_visualization(
         epochs=epochs,
         use_dcp_loss=use_dcp_loss,
         lambda_reg=lambda_reg,
-    )
-
-    # Compute virtual point cloud for visualization (use first validation sample)
-    print("\n=== Computing Virtual Point Cloud (Validation Sample) ===")
-    val_sample = full_dataset[val_indices[0]]
-    P1 = val_sample["source"].numpy()
-    P2 = val_sample["target"].numpy()
-
-    correspondances, probabilities, virtual_point_cloud = compute_virtual_point_cloud(
-        model, P1, P2
-    )
-
-    # Verify probabilities sum to 1 for each row
-    prob_sums = np.sum(probabilities, axis=1)
-    print(f"\n=== Probability Verification ===")
-    print(
-        f"Probabilities sum to 1 per row? {np.allclose(prob_sums, np.ones_like(prob_sums))}"
-    )
-    print(f"  Min sum: {prob_sums.min():.6f}")
-    print(f"  Max sum: {prob_sums.max():.6f}")
-    print(f"  Mean sum: {prob_sums.mean():.6f}")
-
-    # Analyze probability distribution
-    max_probs = np.max(probabilities, axis=1)
-    mean_max_prob = max_probs.mean()
-    print(f"\nProbability distribution:")
-    print(f"  Mean of max prob per row: {mean_max_prob:.4f}")
-    print(f"  Min of max prob per row: {max_probs.min():.4f}")
-    print(f"  Max of max prob per row: {max_probs.max():.4f}")
-
-    if mean_max_prob < 0.5:
-        print(f"  → Probabilities are spread out (uniform-like)")
-    else:
-        print(f"  → Probabilities are concentrated (peaked)")
-
-    # Output shapes
-    print(f"\nCorrespondances shape: {correspondances.shape}")
-    print(f"Probabilities shape: {probabilities.shape}")
-    print(f"Virtual point cloud shape: {virtual_point_cloud.shape}")
-
-    # Save the correspondances
-    print("\n=== Saving Results ===")
-    os.makedirs("neural_network/results", exist_ok=True)
-    np.savetxt(
-        "neural_network/results/correspondances.csv", correspondances, delimiter=","
-    )
-    np.savetxt("neural_network/results/probabilities.csv", probabilities, delimiter=",")
-    print("Results saved to neural_network/results/")
-
-    # Visualize the probabilities for selected points
-    print("\n=== Generating Visualizations ===")
-    visualize_probabilities(
-        probabilities,
-        num_points=8,
-        save_path="neural_network/results/probability_visualization.png",
-    )
-
-    # Plot the source, target and virtual point cloud
-    plot_point_clouds(
-        P1,
-        P2,
-        virtual_point_cloud,
-        save_path="neural_network/results/point_cloud_visualization.png",
     )
 
 
