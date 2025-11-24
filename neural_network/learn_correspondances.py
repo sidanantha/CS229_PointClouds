@@ -3,12 +3,33 @@
 # This script learns the correspondances between two point clouds using a neural network.
 
 # Import necessary libraries
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import numpy as np
+from CorrespondanceNet import CorrespondanceNet
 
-# Define the neural network
-class CorrespondanceNet(nn.Module):
-    def __init__(self):
-        super(CorrespondanceNet, self).__init__()
-        self.fc1 = nn.Linear(100, 100)
+def learn_correspondances(P1, P2):
+    """
+    Learn the correspondances between two point clouds using a neural network.
+    """
+    # Create the neural network
+    correspondance_net = CorrespondanceNet()
+    # Learn the correspondances
+    correspondances = correspondance_net.compute_correspondances(P1, P2)
+    
+    # Output:
+    print(f"Correspondances: {correspondances}")
+    print(f"Correspondances shape: {correspondances.shape}")
+    
+    return correspondances
+
+
+def __main__():
+    # Create example point clouds
+    P1 = np.random.rand(100, 3)
+    P2 = np.random.rand(100, 3)
+    # Learn the correspondances
+    correspondances = learn_correspondances(P1, P2)
+    # Save the correspondances
+    np.savetxt("correspondances.csv", correspondances, delimiter=",")
+
+if __name__ == "__main__":
+    __main__()
