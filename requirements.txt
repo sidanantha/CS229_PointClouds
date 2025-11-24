@@ -6,4 +6,5 @@ pandas==1.4.1
 matplotlib==3.5.1
 scikit-image==0.19.2
 imgaug==0.4.0
-
+torch==2.1.2+cu118
+tqdm==4.67.1
