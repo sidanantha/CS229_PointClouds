@@ -215,15 +215,28 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
     UNPERTURBED_W_CHIEF = np.array([0.0, 0.0, 0.0])
     # Map from candidate index (1-based) to perturbed w_chief you want to use.
     # Fill these in as needed, e.g.:
-    # PERTURBED_W_CHIEF_BY_CANDIDATE = {
-    #     1: np.array([0.0, 0.01, 0.0]),
-    #     2: np.array([0.0, 0.02, 0.0]),
-    # }
-    PERTURBED_W_CHIEF_BY_CANDIDATE = {}
+    PERTURBED_W_CHIEF_BY_CANDIDATE = {
+        1: np.array([0.0, 0.0, 0.1]),
+        2: np.array([0.0, 0.1, 0.0]),
+        3: np.array([0.1, 0.0, 0.0]),
+        4: np.array([0.1, 0.1, 0.1]),
+        5: np.array([0.5, 0.5, 0.5]),
+        6: np.array([0.1, 0.2, 0.3]),
+        7: np.array([0.4, 0.5, 0.6]),
+        8: np.array([0.1, 0.0, 0.1]),
+        9: np.array([0.1, 1.0, 0.1]),
+        10: np.array([1.0, 1.0, 1.0]),
+        11: np.array([1.0, 0.0, 0.0]),
+        12: np.array([0.0, 1.0, 0.0]),
+        13: np.array([0.0, 0.0, 1.0]),
+        14: np.array([0.01, 0.01, 0.01]),
+        15: np.array([0.01, 0.00, 0.00]),
+    }
     
     w_chief_configs = [
-        ("un_perturbed", "un_perturbed",
-         lambda idx: UNPERTURBED_W_CHIEF),
+        # Temporarily commented out for testing perturbed only
+        # ("un_perturbed", "un_perturbed",
+        #  lambda idx: UNPERTURBED_W_CHIEF),
         ("perturbed", "perturbed",
          lambda idx: PERTURBED_W_CHIEF_BY_CANDIDATE.get(idx, params.w0_chief)),
     ]
@@ -234,6 +247,10 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
         print("=" * 80)
         
         for candidate_idx, trajectory_candidate in enumerate(trajectory_candidates, start=1):
+            # Temporarily only process candidates 12-16 (inclusive)
+            if candidate_idx < 12 or candidate_idx > 16:
+                continue
+            
             print("\n" + "-" * 80)
             print(f"[{config_label}] Candidate {candidate_idx}/{len(trajectory_candidates)}: {trajectory_candidate}")
             print("-" * 80)
@@ -318,6 +335,7 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
             test_cameras = []
             
             # Loop through time steps
+            print(f"  Starting tau loop: {actual_tau_steps} steps (0 to {actual_tau_steps-1})")
             for tau_idx in range(actual_tau_steps):
                 tau_value = tau_idx * tau_time_step
                 
@@ -444,6 +462,12 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
                     sphere_radius=1.2
                 )
                 
+                # Verify files were created
+                if not os.path.exists(ply_path):
+                    print(f"  WARNING: PLY file not created for tau_{tau_idx}: {ply_path}")
+                if not os.path.exists(csv_path):
+                    print(f"  WARNING: CSV file not created for tau_{tau_idx}: {csv_path}")
+                
                 generated_files['point_clouds'].append({
                     'tau_idx': tau_idx,
                     'tau_value': tau_value,
@@ -454,6 +478,9 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
                 
                 if (tau_idx + 1) % 10 == 0:
                     print(f"  ✓ [{config_label}] Processed {tau_idx + 1}/{actual_tau_steps} viewpoints")
+                elif tau_idx == 0 or tau_idx == actual_tau_steps - 1:
+                    # Always print first and last tau for debugging
+                    print(f"  ✓ [{config_label}] Processed tau_{tau_idx} (file: {ply_filename})")
             
             # Render uncertainty heat maps for all cameras after the tau loop
             if len(test_cameras) > 0:

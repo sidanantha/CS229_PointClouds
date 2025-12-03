@@ -13,7 +13,7 @@ class PointCloudDataset(Dataset):
 
         Dataset structure:
         dataset_dir/
-            3DGS_PC/
+            3DGS_PC_un_perturbed/
                 1/1_tau_0.csv, 1_tau_1.csv, ...
                 2/2_tau_0.csv, 2_tau_1.csv, ...
                 ...
@@ -25,7 +25,7 @@ class PointCloudDataset(Dataset):
         self.dataset_dir = dataset_dir
         self.test = test
 
-        self.src_root = os.path.join(dataset_dir, "3DGS_PC")
+        self.src_root = os.path.join(dataset_dir, "3DGS_PC_un_perturbed")
         self.tgt_root = os.path.join(dataset_dir, "3DGS_PC_perturbed")
 
         # Define valid folders based on split
