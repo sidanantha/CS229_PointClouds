@@ -25,8 +25,8 @@ import torchvision
 # Note: These imports assume the script is run from the project root directory
 from Run_Code import params
 from Core_Math_Infrastructure.dynamics import RelativeDynamics
-from Core_Math_Infrastructure.transformations import coe2rv
-from Core_Math_Infrastructure.quaternions import quat2rot, rotation_from_to
+from Core_Math_Infrastructure.transformations import coe2rv, body2rtnRotmat
+from Core_Math_Infrastructure.quaternions import quat2rot, rotation_from_to, quatMul, rot2quat
 from Core_Math_Infrastructure.propagate_relative_orbit import propagate_relative_orbit
 from Core_Math_Infrastructure.FODEpropagator import FODE_step
 from Trajectory_Selection.FOV import determine_fov
@@ -199,229 +199,302 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
     # For 1 orbit (T_single_orbit), divide into num_tau_steps
     tau_time_step = params.T_single_orbit / num_tau_steps
     
-    print("\n[3/4] Precomputing chief state data...")
-    # Precompute chief attitude and points for all time steps
-    q_chief_array = [None] * num_tau_steps
-    w_chief_array = [None] * num_tau_steps
-    pos_chief_array = [None] * num_tau_steps
-    vel_chief_array = [None] * num_tau_steps
-    
-    # Initialize chief state
-    q_chief = params.q0_chief
-    w_chief = params.w0_chief
-    pos_chief, vel_chief = coe2rv(params.a_chief, params.e_chief, params.i_chief, 
-                                   params.raan_chief, params.w_chief, params.M_chief)
-    
-    # Create dynamics object for chief propagation
-    dynamics = RelativeDynamics(params.Js, params.Jt)
-    dynamics.set_mean_motion(params.a_chief * 1000)  # km to m
-    
-    t_idx = 0
-    t = 0
-    t_end = params.T_single_orbit
-    
-    while t <= t_end and t_idx < num_tau_steps:
-        # Propagate chief attitude by one time step using params.dt
-        q_chief_new, w_chief_new = dynamics.propagate_attitude(
-            params.dt, q_chief, w_chief, np.zeros(3), np.zeros(3), np.zeros(3)
-        )
-        
-        # Propagate chief state
-        stateIn = np.concatenate((pos_chief, vel_chief))
-        new_chief_state = FODE_step(stateIn, params.dt, "w/ J2")
-        pos_chief, vel_chief = new_chief_state[:3], new_chief_state[3:]
-        
-        # Store chief data at tau time instants
-        if t_idx < num_tau_steps:
-            q_chief_array[t_idx] = q_chief.copy()
-            w_chief_array[t_idx] = w_chief.copy()
-            pos_chief_array[t_idx] = pos_chief.copy()
-            vel_chief_array[t_idx] = vel_chief.copy()
-        
-        # Update chief state for next iteration
-        q_chief = q_chief_new
-        w_chief = w_chief_new
-        t += tau_time_step
-        t_idx += 1
-    
-    # Trim arrays to actual size in case we didn't reach num_tau_steps
-    q_chief_array = q_chief_array[:t_idx]
-    w_chief_array = w_chief_array[:t_idx]
-    pos_chief_array = pos_chief_array[:t_idx]
-    vel_chief_array = vel_chief_array[:t_idx]
-    actual_tau_steps = t_idx
-    
-    print(f"✓ Precomputed {actual_tau_steps} chief states over 1 orbit")
-    
-    # Process each trajectory candidate
-    print("\n[4/4] Processing trajectory candidates...")
+    # Process each trajectory candidate for each w_chief configuration
+    print("\n[3/4] Processing trajectory candidates with multiple w_chief configurations...")
     dataset_info = []
+    total_point_clouds = 0
     
-    chief_oe_0 = np.array([params.a_chief, params.e_chief, params.i_chief, 
-                           params.raan_chief, params.w_chief, params.M_chief])
+    chief_oe_0 = np.array(
+        [params.a_chief, params.e_chief, params.i_chief,
+         params.raan_chief, params.w_chief, params.M_chief]
+    )
     
-    for candidate_idx, trajectory_candidate in enumerate(trajectory_candidates, start=1):
-        print("\n" + "-" * 80)
-        print(f"Candidate {candidate_idx}/{len(trajectory_candidates)}: {trajectory_candidate}")
-        print("-" * 80)
+    # Configuration list: (label, suffix, selector for initial w_chief)
+    # UNPERTURBED: w_chief = [0, 0, 0]
+    # PERTURBED: per-candidate w_chief that you will fill in below.
+    UNPERTURBED_W_CHIEF = np.array([0.0, 0.0, 0.0])
+    # Map from candidate index (1-based) to perturbed w_chief you want to use.
+    # Fill these in as needed, e.g.:
+    # PERTURBED_W_CHIEF_BY_CANDIDATE = {
+    #     1: np.array([0.0, 0.01, 0.0]),
+    #     2: np.array([0.0, 0.02, 0.0]),
+    # }
+    PERTURBED_W_CHIEF_BY_CANDIDATE = {}
+    
+    w_chief_configs = [
+        ("un_perturbed", "un_perturbed",
+         lambda idx: UNPERTURBED_W_CHIEF),
+        ("perturbed", "perturbed",
+         lambda idx: PERTURBED_W_CHIEF_BY_CANDIDATE.get(idx, params.w0_chief)),
+    ]
+    
+    for config_label, suffix, w_selector in w_chief_configs:
+        print("\n" + "=" * 80)
+        print(f"CONFIG: {config_label}")
+        print("=" * 80)
         
-        # Create output directory for this candidate's point clouds
-        candidate_output_dir = os.path.join(output_base_dir, "3DGS_PC", f"{candidate_idx}")
-        os.makedirs(candidate_output_dir, exist_ok=True)
-        
-        # Track generated files for this candidate
-        generated_files = {
-            'candidate_idx': candidate_idx,
-            'trajectory': trajectory_candidate.tolist(),
-            'point_clouds': []
-        }
-        
-        # List to store cameras for heat map rendering
-        test_cameras = []
-        
-        # Loop through time steps
-        for tau_idx in range(actual_tau_steps):
-            tau_value = tau_idx * tau_time_step
+        for candidate_idx, trajectory_candidate in enumerate(trajectory_candidates, start=1):
+            print("\n" + "-" * 80)
+            print(f"[{config_label}] Candidate {candidate_idx}/{len(trajectory_candidates)}: {trajectory_candidate}")
+            print("-" * 80)
             
-            # Propagate ROE using relative orbit propagator
-            roe_new, rtn_pos, rtn_vel = propagate_relative_orbit(
-                trajectory_candidate, chief_oe_0, tau_value
+            # Choose initial chief angular velocity for this candidate/config
+            w_chief_init = w_selector(candidate_idx)
+            
+            print(f"Initial w_chief for this run: {w_chief_init}")
+            
+            print("\n[3a/4] Precomputing chief state data for this candidate and config...")
+            # Precompute chief attitude and points for all time steps for this w_chief
+            q_chief_array = [None] * num_tau_steps
+            w_chief_array = [None] * num_tau_steps
+            pos_chief_array = [None] * num_tau_steps
+            vel_chief_array = [None] * num_tau_steps
+            
+            # Initialize chief state
+            q_chief = params.q0_chief
+            w_chief = w_chief_init
+            pos_chief, vel_chief = coe2rv(
+                params.a_chief, params.e_chief, params.i_chief,
+                params.raan_chief, params.w_chief, params.M_chief
             )
             
-            # Get precomputed chief data
-            q_chief = q_chief_array[tau_idx]
-            w_chief = w_chief_array[tau_idx]
-            pos_chief = pos_chief_array[tau_idx]
-            vel_chief = vel_chief_array[tau_idx]
+            # Create dynamics object for chief propagation
+            dynamics = RelativeDynamics(params.Js, params.Jt)
+            dynamics.set_mean_motion(params.a_chief * 1000)  # km to m
             
-            # === Define Camera Pose ===
-            world_up = np.array([0, 0, +1])
-            r_rtn = rtn_pos * 1e3  # Convert to meters
+            t_idx = 0
+            t = 0
+            t_end = params.T_single_orbit
             
-            # Compute rotation from RTN to camera frame
-            q_rtn2camera = rotation_from_to(world_up, -r_rtn)
-            R_rtn2camera = quat2rot(q_rtn2camera)
+            while t <= t_end and t_idx < num_tau_steps:
+                # Propagate chief attitude by one time step using params.dt
+                q_chief_new, w_chief_new = dynamics.propagate_attitude(
+                    params.dt, q_chief, w_chief, np.zeros(3), np.zeros(3), np.zeros(3)
+                )
+                
+                # Propagate chief state
+                stateIn = np.concatenate((pos_chief, vel_chief))
+                new_chief_state = FODE_step(stateIn, params.dt, "w/ J2")
+                pos_chief, vel_chief = new_chief_state[:3], new_chief_state[3:]
+                
+                # Store chief data at tau time instants
+                if t_idx < num_tau_steps:
+                    q_chief_array[t_idx] = q_chief.copy()
+                    w_chief_array[t_idx] = w_chief.copy()
+                    pos_chief_array[t_idx] = pos_chief.copy()
+                    vel_chief_array[t_idx] = vel_chief.copy()
+                
+                # Update chief state for next iteration
+                q_chief = q_chief_new
+                w_chief = w_chief_new
+                t += tau_time_step
+                t_idx += 1
             
-            # Rotate position from RTN to camera frame
-            r_chief2camera_vbs = R_rtn2camera @ r_rtn
-            r_Vo2To_vbs_true = -r_chief2camera_vbs
+            # Trim arrays to actual size in case we didn't reach num_tau_steps
+            q_chief_array = q_chief_array[:t_idx]
+            w_chief_array = w_chief_array[:t_idx]
+            pos_chief_array = pos_chief_array[:t_idx]
+            vel_chief_array = vel_chief_array[:t_idx]
+            actual_tau_steps = t_idx
             
-            # Quaternion rotating camera frame into chief's world frame
-            q_vbs2tango_true = rotation_from_to(r_Vo2To_vbs_true, world_up)
+            print(f"✓ Precomputed {actual_tau_steps} chief states over 1 orbit for this candidate/config")
             
-            # === Render Ground Truth Image ===
-            gt_image_path, gt_mask_path = render_gt_image(
-                r_Vo2To_vbs_true, 
-                q_vbs2tango_true, 
-                tau_idx, 
-                output_base_dir,
-                candidate_idx=candidate_idx
+            # Create output directory for this candidate's point clouds
+            candidate_output_dir = os.path.join(
+                output_base_dir, f"3DGS_PC_{suffix}", f"{candidate_idx}"
             )
+            os.makedirs(candidate_output_dir, exist_ok=True)
             
-            # Convert ROE to 3DGS pose
-            pose = DynamicCameraLoader._convert_roe_to_3dgs(q_vbs2tango_true, r_Vo2To_vbs_true)
+            # Track generated files for this candidate & config
+            generated_files = {
+                'candidate_idx': candidate_idx,
+                'trajectory': trajectory_candidate.tolist(),
+                'config': config_label,
+                'w_chief_init': w_chief_init.tolist(),
+                'point_clouds': []
+            }
             
-            # Extract R, t for camera object
-            R_w2c = pose[:3, :3]
-            t_w2c = pose[:3, 3]
+            # List to store cameras for heat map rendering
+            test_cameras = []
             
-            # Build camera object
-            FoVx = 2.0 * np.arctan(params.W / (2.0 * params.fx))
-            FoVy = 2.0 * np.arctan(params.H / (2.0 * params.fy))
+            # Loop through time steps
+            for tau_idx in range(actual_tau_steps):
+                tau_value = tau_idx * tau_time_step
+                
+                # Propagate ROE using relative orbit propagator
+                roe_new, rtn_pos, rtn_vel = propagate_relative_orbit(
+                    trajectory_candidate, chief_oe_0, tau_value
+                )
+                
+                # Get precomputed chief data
+                q_chief = q_chief_array[tau_idx]
+                w_chief = w_chief_array[tau_idx]
+                pos_chief = pos_chief_array[tau_idx]
+                vel_chief = vel_chief_array[tau_idx]
+                
+                # === Define Camera Pose (match NBVS selection logic) ===
+                # Reference +z direction in world frame:
+                camera_up = np.array([0, 0, +1])
+                
+                # Position from chief to camera in the chief's RTN frame:
+                r_rtn = rtn_pos * 1e3  # Convert to meters
+                
+                # Compute the rotation from camera vector to RTN boresight in RTN frame:
+                q_rtn2camera = rotation_from_to(camera_up, -r_rtn)
+                R_rtn2camera = quat2rot(q_rtn2camera)
+                
+                # Rotate the position from RTN to camera frame:
+                r_chief2camera_vbs = R_rtn2camera @ r_rtn  # chief→camera in camera (VBS) frame
+                
+                # Position vector from camera to chief, in the camera frame
+                r_Vo2To_vbs_true = -r_chief2camera_vbs
+                
+                # We are given q_chief as a rotation from chief body-fixed frame to inertial (ECI).
+                # Convert this to RTN, then to body-fixed again to get camera-to-chief direction in BF.
+                R_eci2rtn = body2rtnRotmat(q_chief, pos_chief, vel_chief)
+                q_eci2rtn = rot2quat(R_eci2rtn)
+                # q_chief: BF -> ECI, q_eci2rtn: ECI -> RTN, so q_chief_rtn: BF -> RTN
+                q_chief_rtn = quatMul(q_eci2rtn, q_chief)
+                q_chief_rtn /= np.linalg.norm(q_chief_rtn)
+                
+                # Convert RTN direction from camera to chief into chief body-fixed frame
+                R_bf2rtn = quat2rot(q_chief_rtn)
+                R_rtn2bf = R_bf2rtn.T
+                r_cam2chief_bf = R_rtn2bf @ (-r_rtn)
+                
+                # Quaternion rotating camera frame into chief's world frame
+                # Rotate from camera +z to body-fixed direction to chief
+                q_vbs2tango_true = rotation_from_to(camera_up, r_cam2chief_bf)
+                
+                # === Render Ground Truth Image ===
+                gt_image_path, gt_mask_path = render_gt_image(
+                    r_Vo2To_vbs_true, 
+                    q_vbs2tango_true, 
+                    tau_idx, 
+                    output_base_dir,
+                    candidate_idx=candidate_idx
+                )
+                
+                # Convert ROE to 3DGS pose
+                pose = DynamicCameraLoader._convert_roe_to_3dgs(q_vbs2tango_true, r_Vo2To_vbs_true)
+                
+                # Extract R, t for camera object
+                R_w2c = pose[:3, :3]
+                t_w2c = pose[:3, 3]
+                
+                # Build camera object
+                FoVx = 2.0 * np.arctan(params.W / (2.0 * params.fx))
+                FoVy = 2.0 * np.arctan(params.H / (2.0 * params.fy))
+                
+                # Create dummy image tensor
+                dummy_image_tensor = torch.zeros(
+                    (3, int(params.H), int(params.W)),
+                    dtype=torch.float32, device="cuda"
+                )
+                
+                camera = Camera(
+                    colmap_id=tau_idx,
+                    R=R_w2c,
+                    T=t_w2c,
+                    FoVx=FoVx,
+                    FoVy=FoVy,
+                    image=dummy_image_tensor,
+                    gt_alpha_mask=None,
+                    image_name=f"tau_{tau_idx}",
+                    uid=tau_idx,
+                    trans=np.array([0.0, 0.0, 0.0]),
+                    scale=1.0,
+                    data_device="cuda"
+                )
+                
+                # Add camera to list for heat map rendering
+                test_cameras.append(camera)
+                
+                # === Render 3DGS image ===
+                gs_output_dir = os.path.join(
+                    output_base_dir, f"3DGS_Renderer_{suffix}", str(candidate_idx)
+                )
+                os.makedirs(gs_output_dir, exist_ok=True)
+                render_image(camera, gaussians, pipeline, background, gs_output_dir, tau_idx)
+                
+                # Extract point cloud from this viewpoint
+                ply_filename = f"{candidate_idx}_tau_{tau_idx}.ply"
+                csv_filename = f"{candidate_idx}_tau_{tau_idx}.csv"
+                
+                ply_path = os.path.join(candidate_output_dir, ply_filename)
+                csv_path = os.path.join(candidate_output_dir, csv_filename)
+                
+                # Get point cloud from view
+                point_cloud_data = get_point_cloud_from_view(
+                    view=camera,
+                    gaussians=gaussians,
+                    pipeline=pipeline,
+                    background=background,
+                    output_path=ply_path,  # This will save both PLY and CSV
+                    filter_uncertainty=False,
+                    filter_depth=False,
+                    color_by_uncertainty=False,
+                    transform_to_camera=True,
+                    q_camera2world=q_vbs2tango_true,
+                    r_camera2world_origin=r_Vo2To_vbs_true,
+                    filter_occluded=True,
+                    occlusion_threshold=0.99,
+                    filter_sphere=True,
+                    sphere_center=r_Vo2To_vbs_true,
+                    sphere_radius=1.2
+                )
+                
+                generated_files['point_clouds'].append({
+                    'tau_idx': tau_idx,
+                    'tau_value': tau_value,
+                    'num_points': len(point_cloud_data['points']),
+                    'ply_file': ply_path,
+                    'csv_file': csv_path
+                })
+                
+                if (tau_idx + 1) % 10 == 0:
+                    print(f"  ✓ [{config_label}] Processed {tau_idx + 1}/{actual_tau_steps} viewpoints")
             
-            # Create dummy image tensor
-            dummy_image_tensor = torch.zeros((3, int(params.H), int(params.W)), 
-                                            dtype=torch.float32, device="cuda")
+            # Render uncertainty heat maps for all cameras after the tau loop
+            if len(test_cameras) > 0:
+                output_dir = os.path.join(
+                    output_base_dir, f"3DGS_Uncertainty_Heatmap_{suffix}", str(candidate_idx)
+                )
+                os.makedirs(output_dir, exist_ok=True)
+                print(
+                    f"Rendering uncertainty heat maps for candidate {candidate_idx} "
+                    f"with {len(test_cameras)} cameras (config={config_label})..."
+                )
+                render_set_current_with_output_path(
+                    output_path=output_dir,  # Save to 3DGS_Uncertainty_Heatmap_<suffix>/<candidate_idx>/
+                    test_views=test_cameras,  # List of Camera objects
+                    gaussians=gaussians,
+                    pipeline=pipeline,
+                    background=background,
+                    args=None
+                )
+                print(f"Rendered uncertainty heat maps for candidate {candidate_idx} (config={config_label})")
             
-            camera = Camera(
-                colmap_id=tau_idx,
-                R=R_w2c,
-                T=t_w2c,
-                FoVx=FoVx,
-                FoVy=FoVy,
-                image=dummy_image_tensor,
-                gt_alpha_mask=None,
-                image_name=f"tau_{tau_idx}",
-                uid=tau_idx,
-                trans=np.array([0.0, 0.0, 0.0]),
-                scale=1.0,
-                data_device="cuda"
+            dataset_info.append(generated_files)
+            total_point_clouds += len(generated_files['point_clouds'])
+            print(
+                f"✓ [{config_label}] Candidate {candidate_idx} complete: "
+                f"Generated {actual_tau_steps} point clouds"
             )
-            
-            # Add camera to list for heat map rendering
-            test_cameras.append(camera)
-            
-            # === Render 3DGS image ===
-            gs_output_dir = os.path.join(output_base_dir, "3DGS_Renderer", str(candidate_idx))
-            os.makedirs(gs_output_dir, exist_ok=True)
-            render_image(camera, gaussians, pipeline, background, gs_output_dir, tau_idx)
-            
-            # Extract point cloud from this viewpoint
-            ply_filename = f"{candidate_idx}_tau_{tau_idx}.ply"
-            csv_filename = f"{candidate_idx}_tau_{tau_idx}.csv"
-            
-            ply_path = os.path.join(candidate_output_dir, ply_filename)
-            csv_path = os.path.join(candidate_output_dir, csv_filename)
-            
-            # Get point cloud from view
-            point_cloud_data = get_point_cloud_from_view(
-                view=camera,
-                gaussians=gaussians,
-                pipeline=pipeline,
-                background=background,
-                output_path=ply_path,  # This will save both PLY and CSV
-                filter_uncertainty=False,
-                filter_depth=False,
-                color_by_uncertainty=False,
-                transform_to_camera=True,
-                q_camera2world=q_vbs2tango_true,
-                r_camera2world_origin=r_Vo2To_vbs_true,
-                filter_occluded=True,
-                occlusion_threshold=0.99,
-                filter_sphere=True,
-                sphere_center=r_Vo2To_vbs_true,
-                sphere_radius=1.2
-            )
-            
-            generated_files['point_clouds'].append({
-                'tau_idx': tau_idx,
-                'tau_value': tau_value,
-                'num_points': len(point_cloud_data['points']),
-                'ply_file': ply_path,
-                'csv_file': csv_path
-            })
-            
-            if (tau_idx + 1) % 10 == 0:
-                print(f"  ✓ Processed {tau_idx + 1}/{actual_tau_steps} viewpoints")
-        
-        # Render uncertainty heat maps for all cameras after the tau loop
-        if len(test_cameras) > 0:
-            output_dir = os.path.join(output_base_dir, "3DGS_Uncertainty_Heatmap", str(candidate_idx))
-            os.makedirs(output_dir, exist_ok=True)
-            print(f"Rendering uncertainty heat maps for candidate {candidate_idx} with {len(test_cameras)} cameras...")
-            render_set_current_with_output_path(
-                output_path=output_dir,  # Save to 3DGS_Uncertainty_Heatmap/<candidate_idx>/
-                test_views=test_cameras,  # List of Camera objects
-                gaussians=gaussians,
-                pipeline=pipeline,
-                background=background,
-                args=None
-            )
-            print(f"Rendered uncertainty heat maps for candidate {candidate_idx}")
-        
-        dataset_info.append(generated_files)
-        print(f"✓ Candidate {candidate_idx} complete: Generated {actual_tau_steps} point clouds")
     
     print("\n" + "=" * 80)
     print("DATASET GENERATION COMPLETE")
     print("=" * 80)
     print(f"Total candidates processed: {len(trajectory_candidates)}")
-    print(f"Total point clouds generated: {len(trajectory_candidates) * actual_tau_steps}")
+    print(f"Total point clouds generated (all configs): {total_point_clouds}")
     print(f"Base output directory: {output_base_dir}")
-    print(f"  - Point clouds: {output_base_dir}/3DGS_PC/")
-    print(f"  - Rendered images: {output_base_dir}/GT_Renderer/")
-    print(f"  - 3DGS renders: {output_base_dir}/3DGS_Renderer/")
-    print(f"  - Uncertainty heatmaps: {output_base_dir}/3DGS_Uncertainty_Heatmap/")
+    print(f"  - Point clouds (unperturbed): {output_base_dir}/3DGS_PC_un_perturbed/")
+    print(f"  - Point clouds (perturbed):   {output_base_dir}/3DGS_PC_perturbed/")
+    print(f"  - Rendered images:            {output_base_dir}/GT_Renderer/")
+    print(f"  - 3DGS renders (unperturbed): {output_base_dir}/3DGS_Renderer_un_perturbed/")
+    print(f"  - 3DGS renders (perturbed):   {output_base_dir}/3DGS_Renderer_perturbed/")
+    print(f"  - Uncertainty heatmaps (unperturbed): {output_base_dir}/3DGS_Uncertainty_Heatmap_un_perturbed/")
+    print(f"  - Uncertainty heatmaps (perturbed):   {output_base_dir}/3DGS_Uncertainty_Heatmap_perturbed/")
     print("=" * 80)
     
     return dataset_info
