@@ -114,11 +114,16 @@ def collate_fn(batch):
     Returns:
         Dictionary with lists of tensors instead of stacked tensors
     """
-    return {
+    result = {
         "source": [item["source"] for item in batch],
         "target": [item["target"] for item in batch],
         "filename": [item["filename"] for item in batch],
-        "transform": torch.stack(
-            [item["transform"] for item in batch]
-        ),  # transforms are same size (4x4)
     }
+    
+    # Only include transform if it exists in the batch items
+    if "transform" in batch[0]:
+        result["transform"] = torch.stack(
+            [item["transform"] for item in batch]
+        )  # transforms are same size (4x4)
+    
+    return result

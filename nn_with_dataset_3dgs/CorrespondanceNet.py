@@ -31,11 +31,25 @@ class CorrespondanceNet(nn.Module):
         P1: (N1, 3) point cloud
         P2: (N2, 3) point cloud
         Returns:
-            correspondances: (N1, N2) correspondance matrix
+            correspondances: (N1, N2) correspondance matrix (dot product)
         """
         F1 = self.forward(P1)
         F2 = self.forward(P2)
         return F1 @ F2.T
+    
+    def compute_distance_cost(self, P1, P2):
+        """
+        Compute distance-based cost matrix for optimal transport.
+        P1: (N1, 3) point cloud
+        P2: (N2, 3) point cloud
+        Returns:
+            C: (N1, N2) cost matrix (distances)
+        """
+        F1 = self.forward(P1)
+        F2 = self.forward(P2)
+        # Use feature distance as cost
+        C = torch.cdist(F1, F2)  # (N1, N2) pairwise distances
+        return C
 
     def softmax_correspondances(self, correspondances):
         """
@@ -44,6 +58,48 @@ class CorrespondanceNet(nn.Module):
             correspondances: (N1, N2) softmaxed correspondance matrix
         """
         return torch.softmax(correspondances, dim=1)
+
+    def log_sinkhorn(self, log_scores, num_iterations=10):
+        """
+        Correct log-domain Sinkhorn algorithm with u,v scaling.
+        This enforces true doubly stochastic constraints and prevents collapse.
+        
+        Args:
+            log_scores: (N, M) log-score matrix (typically -C/epsilon for cost C)
+            num_iterations: Number of Sinkhorn iterations
+        
+        Returns:
+            S: (N, M) doubly stochastic matrix (soft permutation)
+        """
+        # Check for NaN/Inf in input
+        if torch.isnan(log_scores).any() or torch.isinf(log_scores).any():
+            # Fallback to softmax
+            return torch.softmax(-log_scores, dim=1)
+        
+        # Initialize log dual variables
+        log_u = torch.zeros(log_scores.size(0), device=log_scores.device, dtype=log_scores.dtype)
+        log_v = torch.zeros(log_scores.size(1), device=log_scores.device, dtype=log_scores.dtype)
+        
+        # Sinkhorn iterations: update u and v to enforce marginals
+        for _ in range(num_iterations):
+            # Update u: log_u = -logsumexp(log_scores + log_v, dim=1)
+            # This enforces row sums = 1
+            log_u = -torch.logsumexp(log_scores + log_v[None, :], dim=1)
+            
+            # Update v: log_v = -logsumexp(log_scores + log_u, dim=0)
+            # This enforces column sums = 1
+            log_v = -torch.logsumexp(log_scores + log_u[:, None], dim=0)
+        
+        # Compute final doubly stochastic matrix
+        # S = exp(log_scores + log_u[:, None] + log_v[None, :])
+        log_S = log_scores + log_u[:, None] + log_v[None, :]
+        S = torch.exp(log_S)
+        
+        # Final check for NaN/Inf
+        if torch.isnan(S).any() or torch.isinf(S).any():
+            return torch.softmax(-log_scores, dim=1)
+        
+        return S
 
     def virtual_point(self, S, P2):
         """
