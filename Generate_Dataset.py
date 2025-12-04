@@ -17,7 +17,6 @@ import torch
 from pathlib import Path
 from PIL import Image
 
-
 import Renderer.tobypy as tobypy
 import torchvision
 
@@ -234,9 +233,8 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
     }
     
     w_chief_configs = [
-        # Temporarily commented out for testing perturbed only
-        # ("un_perturbed", "un_perturbed",
-        #  lambda idx: UNPERTURBED_W_CHIEF),
+        ("un_perturbed", "un_perturbed",
+         lambda idx: UNPERTURBED_W_CHIEF),
         ("perturbed", "perturbed",
          lambda idx: PERTURBED_W_CHIEF_BY_CANDIDATE.get(idx, params.w0_chief)),
     ]
@@ -247,10 +245,7 @@ def generate_dataset_from_candidates(trajectory_candidates=None, num_tau_steps=1
         print("=" * 80)
         
         for candidate_idx, trajectory_candidate in enumerate(trajectory_candidates, start=1):
-            # Temporarily only process candidates 12-16 (inclusive)
-            if candidate_idx < 12 or candidate_idx > 16:
-                continue
-            
+
             print("\n" + "-" * 80)
             print(f"[{config_label}] Candidate {candidate_idx}/{len(trajectory_candidates)}: {trajectory_candidate}")
             print("-" * 80)
