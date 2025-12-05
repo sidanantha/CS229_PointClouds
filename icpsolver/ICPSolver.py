@@ -149,7 +149,7 @@ class ICPSolver(object):
     def icp(
         self,
         initial=None,
-        plotting=True,
+        plotting=False,
         **kwargs,
     ):
         """
@@ -186,17 +186,18 @@ class ICPSolver(object):
 
         if initial is None:
             initial = self.get_initial_transform_fpfh()
-            print(f"Estimated initial transform:\n{initial}")
+            # print(f"Estimated initial transform:\n{initial}")
 
         self.target = np.asanyarray(self.target, dtype=np.float64)
 
-        self.plot_transform(
-            self.orig_source,
-            self.target,
-            np.eye(4),
-            save_dir="results/init",
-            iteration="before_icp",
-        )
+        if plotting:
+            self.plot_transform(
+                self.orig_source,
+                self.target,
+                np.eye(4),
+                save_dir="results/init",
+                iteration="before_icp",
+            )
 
         if not util.is_shape(self.target, (-1, 3)):
             raise ValueError("points must be (n,3)!")
@@ -207,13 +208,14 @@ class ICPSolver(object):
         total_matrix = initial
 
         # plot after initial transformation
-        self.plot_transform(
-            self.orig_source,
-            self.target,
-            total_matrix,
-            save_dir="results/init",
-            iteration="after_initial",
-        )
+        if plotting:
+            self.plot_transform(
+                self.orig_source,
+                self.target,
+                total_matrix,
+                save_dir="results/init",
+                iteration="after_initial",
+            )
 
         # start with infinite cost
         old_cost = np.inf
@@ -232,20 +234,21 @@ class ICPSolver(object):
             total_matrix = np.dot(matrix, total_matrix)
 
             if abs(old_cost - cost) < self.tolerance:
-                print(
-                    f"Converged at iteration {i}, cost: {cost}, change: {old_cost - cost}"
-                )
-                print(
-                    f"Plotting ICP iteration {i}, cost: {cost}, change: {old_cost - cost}"
-                )
-                self.plot_transform(
-                    self.orig_source,
-                    self.target,
-                    total_matrix,
-                    save_dir="results",
-                    iteration=str(i).zfill(3),
-                    downsample=self.downsample_plotting,
-                )
+                if plotting:
+                    print(
+                        f"Converged at iteration {i}, cost: {cost}, change: {old_cost - cost}"
+                    )
+                    print(
+                        f"Plotting ICP iteration {i}, cost: {cost}, change: {old_cost - cost}"
+                    )
+                    self.plot_transform(
+                        self.orig_source,
+                        self.target,
+                        total_matrix,
+                        save_dir="results",
+                        iteration=str(i).zfill(3),
+                        downsample=self.downsample_plotting,
+                    )
                 break
             else:
                 old_cost = cost
