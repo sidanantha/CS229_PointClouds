@@ -6,23 +6,24 @@ import re
 
 
 class PointCloudDataset(Dataset):
-    def __init__(self, dataset_dir, train_candidates=None, test_candidates=None, train_tau_range=None, test_tau_range=None, test=False):
+    def __init__(self, dataset_dir, train_candidates=None, test_candidates=None, train_tau_range=None, test_tau_range=None, test=False, pc_dir_name="3DGS_PC"):
         """
         Dataset for neural_network structure where:
         - Source (P1): candidate_X/tau_0.csv
         - Target (P2): candidate_X/tau_Y.csv (Y > 0)
         
         Args:
-            dataset_dir: Root directory containing 3DGS_PC folder
+            dataset_dir: Root directory containing the point cloud folder
             train_candidates: List of candidate numbers for training (e.g., [1, 2, ..., 8])
             test_candidates: List of candidate numbers for testing (e.g., [9, 10])
             train_tau_range: Tuple (min_tau, max_tau) for training targets (e.g., (1, 80))
             test_tau_range: Tuple (min_tau, max_tau) for testing targets (e.g., (81, 99))
             test (bool): If True, use test_candidates and test_tau_range. If False, use train_candidates and train_tau_range.
+            pc_dir_name: Name of the point cloud directory (default: "3DGS_PC", can be "3DGS_PC_un_perturbed", etc.)
         
         Dataset structure:
         dataset_dir/
-            3DGS_PC/
+            {pc_dir_name}/
                 1/1_tau_0.csv, 1_tau_1.csv, ...
                 2/2_tau_0.csv, 2_tau_1.csv, ...
                 ...
@@ -44,7 +45,7 @@ class PointCloudDataset(Dataset):
             self.tau_range = train_tau_range
             split_name = "TRAIN"
         
-        self.base_dir = os.path.join(dataset_dir, "3DGS_PC")
+        self.base_dir = os.path.join(dataset_dir, pc_dir_name)
         
         if not os.path.exists(self.base_dir):
             raise ValueError(f"Dataset directory {self.base_dir} does not exist.")

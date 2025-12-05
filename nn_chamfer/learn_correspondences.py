@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Subset
 import utils
 from CorrespondanceNet import CorrespondanceNet
 from PointCloudDataset import PointCloudDataset
-from training_plots import compute_accuracy, plot_training_metrics
+from training_plots import compute_accuracy, compute_rotation_accuracy, plot_training_metrics, save_training_metrics_to_csv
 
 
 def repulsion_loss(points, radius=0.02):
@@ -61,14 +61,18 @@ def column_entropy_loss(probabilities):
         probabilities: (N, M) tensor of correspondence probabilities (softmax output)
     
     Returns:
-        col_entropy_loss: Scalar loss value (negative entropy, to be minimized)
+        col_entropy_loss: Scalar loss value (negative, to be minimized)
+        This returns negative entropy: sum(p * log(p)) which is always <= 0.
+        Minimizing negative entropy is equivalent to maximizing entropy.
+        NOTE: This can make the total loss negative when combined with other terms.
     """
     # p(j) = mean over rows of probabilities[:, j]
     p_col = probabilities.mean(dim=0)  # (M,)
     
-    # Column entropy: sum(p(j) * log(p(j)))
-    # Lower entropy = more concentrated = worse (we want to maximize entropy)
-    # So we minimize negative entropy
+    # Standard entropy: H = -sum(p(j) * log(p(j))) (always positive, higher = more uniform)
+    # Negative entropy: -H = sum(p(j) * log(p(j))) (always negative, since log(p) < 0)
+    # To maximize entropy H, we minimize negative entropy -H
+    # This value will be negative, which is why total loss can be negative
     col_entropy = (p_col * torch.log(p_col + 1e-8)).sum()
     
     return col_entropy
@@ -78,7 +82,7 @@ def load_or_train_model(
     train_loader,
     val_loader=None,
     force_retrain=False,
-    model_path="output/correspondance_net.pth",
+    model_path="nn_chamfer/results/correspondance_net.pth",
     epochs=20,
     lr=0.01,
 ):
@@ -129,6 +133,8 @@ def load_or_train_model(
         val_losses = []
         train_accuracies = []
         val_accuracies = []
+        train_rotation_errors = []  # SO3 rotation errors in degrees
+        val_rotation_errors = []
 
         total_batches = len(train_loader)
         print_every = max(1, total_batches // 10)  # Print ~10 times per epoch
@@ -176,16 +182,17 @@ def load_or_train_model(
                     # Chamfer Distance = average of forward + backward distances
                     chamfer_loss = (min_dist_forward.mean() + min_dist_backward.mean()) / 2.0
                     
-                    # Repulsion loss to prevent collapse in 3D space
-                    repulsion = repulsion_loss(Y_hat, radius=0.02)
+                    # TEMPORARILY COMMENTED OUT: Repulsion loss to prevent collapse in 3D space
+                    # repulsion = repulsion_loss(Y_hat, radius=0.02)
                     
-                    # Column entropy loss to prevent collapse in correspondence space
-                    col_entropy = column_entropy_loss(probabilities)
+                    # TEMPORARILY COMMENTED OUT: Column entropy loss to prevent collapse in correspondence space
+                    # col_entropy = column_entropy_loss(probabilities)
                     
                     # Combine losses
-                    lambda_rep = 0.1  # Weight for repulsion loss
-                    lambda_col = 0.1  # Weight for column entropy loss
-                    loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                    # lambda_rep = 0.1  # Weight for repulsion loss
+                    # lambda_col = 0.1  # Weight for column entropy loss
+                    # loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                    loss = chamfer_loss  # Only using chamfer loss (regularization temporarily disabled)
                     
                     batch_loss += loss
 
@@ -220,6 +227,14 @@ def load_or_train_model(
             train_acc = compute_accuracy(model, train_loader)
             train_accuracies.append(train_acc)
             print(f"  Training Accuracy: {train_acc:.6f}")
+            
+            # Compute training rotation accuracy
+            train_rot_error = compute_rotation_accuracy(
+                model, train_loader,
+                gt_rotations_base_dir=os.path.join(os.path.dirname(os.path.dirname(__file__)), "ground_truth_rotations")
+            )
+            train_rotation_errors.append(train_rot_error)
+            print(f"  Training Rotation Error: {train_rot_error:.4f} degrees")
 
             # Validation (optional)
             if val_loader is not None:
@@ -258,16 +273,17 @@ def load_or_train_model(
                             min_dist_backward = distances_backward.min(dim=1)[0]
                             chamfer_loss = (min_dist_forward.mean() + min_dist_backward.mean()) / 2.0
                             
-                            # Repulsion loss to prevent collapse in 3D space
-                            repulsion = repulsion_loss(Y_hat, radius=0.02)
+                            # TEMPORARILY COMMENTED OUT: Repulsion loss to prevent collapse in 3D space
+                            # repulsion = repulsion_loss(Y_hat, radius=0.02)
                             
-                            # Column entropy loss to prevent collapse in correspondence space
-                            col_entropy = column_entropy_loss(probabilities)
+                            # TEMPORARILY COMMENTED OUT: Column entropy loss to prevent collapse in correspondence space
+                            # col_entropy = column_entropy_loss(probabilities)
                             
                             # Combine losses
-                            lambda_rep = 0.1
-                            lambda_col = 0.1
-                            loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                            # lambda_rep = 0.1
+                            # lambda_col = 0.1
+                            # loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                            loss = chamfer_loss  # Only using chamfer loss (regularization temporarily disabled)
                             
                             val_loss += loss.item()
 
@@ -282,8 +298,17 @@ def load_or_train_model(
                 val_acc = compute_accuracy(model, val_loader)
                 val_accuracies.append(val_acc)
                 print(f"  Validation Accuracy: {val_acc:.6f}")
+                
+                # Compute validation rotation accuracy
+                val_rot_error = compute_rotation_accuracy(
+                    model, val_loader,
+                    gt_rotations_base_dir=os.path.join(os.path.dirname(os.path.dirname(__file__)), "ground_truth_rotations")
+                )
+                val_rotation_errors.append(val_rot_error)
+                print(f"  Validation Rotation Error: {val_rot_error:.4f} degrees")
             else:
                 val_accuracies.append(0.0)
+                val_rotation_errors.append(float('inf'))
 
             # ---- Save per-epoch plots ----
             # Save per-epoch loss plots and concise diagnostics (moved to helper)
@@ -373,6 +398,8 @@ def load_or_train_model(
             'val_losses': val_losses,
             'train_accuracies': train_accuracies,
             'val_accuracies': val_accuracies,
+            'train_rotation_errors': train_rotation_errors,
+            'val_rotation_errors': val_rotation_errors,
         }
         return model, training_history
 
@@ -442,7 +469,7 @@ def save_loss_plots(
     train_losses,
     val_losses,
     epoch,
-    out_dir="loss_plots",
+    out_dir="nn_chamfer/results/loss_plots",
 ):
     """Save per-epoch loss plots (total, rotation, translation).
 
@@ -727,6 +754,88 @@ def plot_point_clouds(
     plt.close()
 
 
+def generate_validation_plots(model, test_dataset, num_samples=3, save_dir="nn_chamfer/results", device='cpu'):
+    """
+    Generate validation plots similar to neural_network/train_with_splits.py
+    
+    Args:
+        model: Trained model
+        test_dataset: Test dataset
+        num_samples: Number of samples to visualize
+        save_dir: Directory to save plots
+        device: Device to run on
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    
+    # Select samples to visualize (evenly spaced)
+    num_samples = min(num_samples, len(test_dataset))
+    sample_indices = np.linspace(0, len(test_dataset) - 1, num_samples, dtype=int)
+    
+    print(f"\n=== Generating Validation Plots ===")
+    print(f"Visualizing {num_samples} test samples...")
+    
+    # Move model to device
+    model = model.to(device)
+    
+    with torch.no_grad():
+        for idx, sample_idx in enumerate(sample_indices):
+            sample = test_dataset[sample_idx]
+            X = sample["source"].to(device)  # (N, 3)
+            Y = sample["target"].to(device)  # (M, 3)
+            filename = sample["filename"]
+            
+            # Compute virtual point cloud
+            correspondances = model.compute_correspondances(X, Y)
+            probabilities = model.softmax_correspondances(correspondances)
+            virtual_Y_tensor = model.virtual_point(probabilities, Y)
+            
+            # Convert to numpy for visualization and saving
+            correspondances_np = correspondances.cpu().detach().numpy()
+            probabilities_np = probabilities.cpu().detach().numpy()
+            virtual_Y = virtual_Y_tensor.cpu().detach().numpy()
+            X_np = X.cpu().numpy()
+            Y_np = Y.cpu().numpy()
+            
+            # Create subdirectory for this sample
+            sample_dir = os.path.join(save_dir, f"validation_sample_{idx+1}_{filename}")
+            os.makedirs(sample_dir, exist_ok=True)
+            
+            # Verify probabilities
+            prob_sums = np.sum(probabilities_np, axis=1)
+            print(f"\n  Sample {idx+1} ({filename}):")
+            print(f"    Probabilities sum to 1? {np.allclose(prob_sums, np.ones_like(prob_sums))}")
+            print(f"    Shapes: X={X_np.shape}, Y={Y_np.shape}, Virtual={virtual_Y.shape}")
+            
+            # Analyze probability distribution
+            max_probs = np.max(probabilities_np, axis=1)
+            mean_max_prob = max_probs.mean()
+            print(f"    Mean max prob: {mean_max_prob:.4f}")
+            
+            # Save correspondances and probabilities
+            np.savetxt(os.path.join(sample_dir, "correspondances.csv"), correspondances_np, delimiter=",")
+            np.savetxt(os.path.join(sample_dir, "probabilities.csv"), probabilities_np, delimiter=",")
+            
+            # Generate probability visualization
+            visualize_probabilities(
+                probabilities_np,
+                num_points=min(8, probabilities_np.shape[0]),
+                save_path=os.path.join(sample_dir, "probability_visualization.png")
+            )
+            
+            # Generate point cloud visualization
+            plot_point_clouds(
+                X_np,
+                Y_np,
+                virtual_Y,
+                save_path=os.path.join(sample_dir, "point_cloud_visualization.png")
+            )
+            
+            print(f"    Saved plots to: {sample_dir}")
+    
+    print(f"\nValidation plots saved to: {save_dir}")
+
+
 def plot_gt_alignment(P1, P2, T_gt, save_path="results/gt_alignment.png"):
     """Plot source (P1), target (P2), and source transformed by ground-truth T_gt.
 
@@ -793,6 +902,7 @@ def run_training_and_visualization(
     force_retrain=False,
     batch_size=8,
     epochs=20,
+    test_batch_sizes=False,
 ):
     """
     Main workflow: load dataset, train model, compute virtual point cloud, and visualize.
@@ -806,22 +916,83 @@ def run_training_and_visualization(
         lambda_reg: Regularization weight for DCP loss (0 to disable)
     """
     print("=== Initializing Dataset ===")
-    full_dataset = PointCloudDataset(dataset_dir=dataset_dir, test=False)
-    print(f"Total samples in dataset: {len(full_dataset)}")
+    # Configuration: candidates 1-11 for train/val, candidates 12-15 for test
+    train_candidates = list(range(1, 12))  # 1-11
+    test_candidates = [12, 13, 14, 15]
+    
+    print(f"Training/Validation: candidates {train_candidates}")
+    print(f"Testing: candidates {test_candidates}")
+    
+    # Create training dataset (candidates 1-11)
+    train_val_dataset = PointCloudDataset(
+        dataset_dir=dataset_dir, 
+        test=False,
+        train_candidates=train_candidates,
+        test_candidates=test_candidates
+    )
+    print(f"Total samples in train/val dataset: {len(train_val_dataset)}")
 
-    # Split dataset into train/val (80/20)
+    # Split dataset into train/val (80/20) - split per candidate to maintain distribution
     random.seed(42)
-    indices = list(range(len(full_dataset)))
-    random.shuffle(indices)
-    split = int(0.8 * len(indices))
-    train_indices = indices[:split]
-    val_indices = indices[split:]
-
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
+    # Group indices by candidate to ensure 80/20 split per candidate
+    candidate_indices = {}
+    for idx in range(len(train_val_dataset)):
+        # Extract candidate number from file path
+        # File path format: .../3DGS_PC_un_perturbed/X/filename.csv
+        sample = train_val_dataset[idx]
+        src_path = sample["source_path"]
+        
+        # Extract candidate number from path: .../X/filename.csv
+        path_parts = src_path.split(os.sep)
+        # Find the candidate number in the path (should be a directory name)
+        candidate_num = None
+        for part in path_parts:
+            if part.isdigit() and int(part) in train_candidates:
+                candidate_num = int(part)
+                break
+        
+        if candidate_num is None:
+            # Fallback: try to extract from filename
+            filename = sample["filename"]
+            try:
+                # If filename is like "X_tau_Y", extract X
+                parts = filename.split('_')
+                if len(parts) > 0:
+                    candidate_num = int(parts[0])
+            except (ValueError, IndexError):
+                # Last resort: use hash-based grouping
+                candidate_num = hash(filename) % len(train_candidates) + 1
+        
+        if candidate_num not in candidate_indices:
+            candidate_indices[candidate_num] = []
+        candidate_indices[candidate_num].append(idx)
+    
+    train_indices = []
+    val_indices = []
+    for candidate_num, indices in candidate_indices.items():
+        random.shuffle(indices)
+        split = int(0.8 * len(indices))
+        train_indices.extend(indices[:split])
+        val_indices.extend(indices[split:])
+    
+    # Shuffle the final lists
+    random.shuffle(train_indices)
+    random.shuffle(val_indices)
+    
+    train_dataset = Subset(train_val_dataset, train_indices)
+    val_dataset = Subset(train_val_dataset, val_indices)
 
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
+    
+    # Create test dataset (candidates 12-15)
+    test_dataset = PointCloudDataset(
+        dataset_dir=dataset_dir,
+        test=True,
+        train_candidates=train_candidates,
+        test_candidates=test_candidates
+    )
+    print(f"Test samples: {len(test_dataset)}")
 
     # Create DataLoaders
     train_loader = DataLoader(
@@ -864,6 +1035,9 @@ def run_training_and_visualization(
 
     # Load or train model
     print("\n=== Loading/Training Model ===")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
     model, training_history = load_or_train_model(
         train_loader,
         val_loader,
@@ -871,19 +1045,23 @@ def run_training_and_visualization(
         epochs=epochs,
     )
     
-    # Train with different batch sizes for batch size analysis
-    # Only do this if we actually trained (not just loaded)
-    if force_retrain or len(training_history['train_losses']) > 0:
+    # Move model to device
+    model = model.to(device)
+    
+    # Train with different batch sizes for batch size analysis (optional)
+    # Only do this if we actually trained (not just loaded) and flag is set
+    batch_size_results = {
+        'batch_sizes': [],
+        'train_losses': [],
+        'val_losses': [],
+        'train_accuracies': [],
+        'val_accuracies': [],
+    }
+    
+    if (force_retrain or len(training_history['train_losses']) > 0) and test_batch_sizes:
         print("\n=== Training with Different Batch Sizes ===")
         batch_sizes_to_test = [1, 2, 4, 8, 16, 32, 64, 100]
         fixed_epochs_for_batch_size = 20  # Number of epochs to train for each batch size
-        batch_size_results = {
-            'batch_sizes': [],
-            'train_losses': [],
-            'val_losses': [],
-            'train_accuracies': [],
-            'val_accuracies': [],
-        }
         
         for bs in batch_sizes_to_test:
             print(f"\n--- Training with batch_size={bs} ---")
@@ -944,16 +1122,17 @@ def run_training_and_visualization(
                         min_dist_backward = distances_backward.min(dim=1)[0]
                         chamfer_loss = (min_dist_forward.mean() + min_dist_backward.mean()) / 2.0
                         
-                        # Repulsion loss to prevent collapse in 3D space
-                        repulsion = repulsion_loss(Y_hat, radius=0.02)
+                        # TEMPORARILY COMMENTED OUT: Repulsion loss to prevent collapse in 3D space
+                        # repulsion = repulsion_loss(Y_hat, radius=0.02)
                         
-                        # Column entropy loss to prevent collapse in correspondence space
-                        col_entropy = column_entropy_loss(probabilities)
+                        # TEMPORARILY COMMENTED OUT: Column entropy loss to prevent collapse in correspondence space
+                        # col_entropy = column_entropy_loss(probabilities)
                         
                         # Combine losses
-                        lambda_rep = 0.1
-                        lambda_col = 0.1
-                        loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                        # lambda_rep = 0.1
+                        # lambda_col = 0.1
+                        # loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                        loss = chamfer_loss  # Only using chamfer loss (regularization temporarily disabled)
                         
                         batch_loss += loss
                     
@@ -999,16 +1178,17 @@ def run_training_and_visualization(
                         min_dist_backward = distances_backward.min(dim=1)[0]
                         chamfer_loss = (min_dist_forward.mean() + min_dist_backward.mean()) / 2.0
                         
-                        # Repulsion loss to prevent collapse in 3D space
-                        repulsion = repulsion_loss(Y_hat, radius=0.02)
+                        # TEMPORARILY COMMENTED OUT: Repulsion loss to prevent collapse in 3D space
+                        # repulsion = repulsion_loss(Y_hat, radius=0.02)
                         
-                        # Column entropy loss to prevent collapse in correspondence space
-                        col_entropy = column_entropy_loss(probabilities)
+                        # TEMPORARILY COMMENTED OUT: Column entropy loss to prevent collapse in correspondence space
+                        # col_entropy = column_entropy_loss(probabilities)
                         
                         # Combine losses
-                        lambda_rep = 0.1
-                        lambda_col = 0.1
-                        loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                        # lambda_rep = 0.1
+                        # lambda_col = 0.1
+                        # loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                        loss = chamfer_loss  # Only using chamfer loss (regularization temporarily disabled)
                         
                         final_train_loss += loss.item()
                         train_batches += 1
@@ -1039,16 +1219,17 @@ def run_training_and_visualization(
                         min_dist_backward = distances_backward.min(dim=1)[0]
                         chamfer_loss = (min_dist_forward.mean() + min_dist_backward.mean()) / 2.0
                         
-                        # Repulsion loss to prevent collapse in 3D space
-                        repulsion = repulsion_loss(Y_hat, radius=0.02)
+                        # TEMPORARILY COMMENTED OUT: Repulsion loss to prevent collapse in 3D space
+                        # repulsion = repulsion_loss(Y_hat, radius=0.02)
                         
-                        # Column entropy loss to prevent collapse in correspondence space
-                        col_entropy = column_entropy_loss(probabilities)
+                        # TEMPORARILY COMMENTED OUT: Column entropy loss to prevent collapse in correspondence space
+                        # col_entropy = column_entropy_loss(probabilities)
                         
                         # Combine losses
-                        lambda_rep = 0.1
-                        lambda_col = 0.1
-                        loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                        # lambda_rep = 0.1
+                        # lambda_col = 0.1
+                        # loss = chamfer_loss + lambda_rep * repulsion + lambda_col * col_entropy
+                        loss = chamfer_loss  # Only using chamfer loss (regularization temporarily disabled)
                         
                         final_val_loss += loss.item()
                         val_batches += 1
@@ -1068,7 +1249,15 @@ def run_training_and_visualization(
             print(f"  Final Train Loss: {final_train_loss:.6f}, Train Acc: {final_train_acc:.6f}")
             print(f"  Final Val Loss: {final_val_loss:.6f}, Val Acc: {final_val_acc:.6f}")
         
-        # Create the 2x2 plot after all batch sizes are tested
+    # Generate plots and save CSV (regardless of whether batch size experiments were run)
+    if force_retrain or len(training_history['train_losses']) > 0:
+        print("\n=== Saving Training Metrics to CSV ===")
+        save_training_metrics_to_csv(
+            training_history,
+            batch_size_results if test_batch_sizes else None,
+            save_path="nn_chamfer/results/training_metrics.csv",
+        )
+        
         print("\n=== Generating Training Metrics Plot ===")
         plot_training_metrics(
             train_losses_vs_epochs=training_history['train_losses'],
@@ -1080,20 +1269,30 @@ def run_training_and_visualization(
             train_accs_vs_batch=batch_size_results['train_accuracies'],
             val_accs_vs_batch=batch_size_results['val_accuracies'],
             batch_sizes=batch_size_results['batch_sizes'],
-            save_path="output/training_metrics.png",
+            save_path="nn_chamfer/results/training_metrics.png",
+        )
+        
+        # Generate validation plots on test samples
+        print("\n=== Generating Validation Plots ===")
+        generate_validation_plots(
+            model=model,
+            test_dataset=test_dataset,
+            num_samples=3,  # Visualize 3 test samples
+            save_dir="nn_chamfer/results",
+            device=device,
         )
     else:
-        print("\n=== Skipping batch size experiments (model was loaded, not trained) ===")
+        print("\n=== Skipping plots (model was loaded, not trained) ===")
         print("Use --retrain flag to generate training plots.")
 
 
-def test_model(save_path="output/test/"):
+def test_model(save_path="nn_chamfer/results/test/"):
     """
     Test the trained model on a sample point cloud pair, visualize results, and save
     resulting transforms.
     """
     print("\n=== Testing Model on Sample Point Cloud Pair ===")
-    model_path = "output/correspondance_net.pth"
+    model_path = "nn_chamfer/results/correspondance_net.pth"
     model = load_model(model_path)
 
     # Load a sample point cloud pair from the dataset
@@ -1115,7 +1314,7 @@ def test_model(save_path="output/test/"):
     visualize_probabilities(
         probabilities,
         num_points=min(8, probabilities.shape[0]),
-        save_path="output/test_probability_visualization.png",
+        save_path="nn_chamfer/results/test_probability_visualization.png",
     )
 
     # Visualize point clouds
@@ -1123,7 +1322,7 @@ def test_model(save_path="output/test/"):
         P,
         Q,
         virtual_Q,
-        save_path="output/test_point_cloud_visualization.png",
+        save_path="nn_chamfer/results/test_point_cloud_visualization.png",
     )
 
     # Compute resulting transforms using SVD
@@ -1196,6 +1395,11 @@ def main():
         action="store_true",
         help="Evaluate trained model on test set after training (default: False)",
     )
+    parser.add_argument(
+        "--test_batch_sizes",
+        action="store_true",
+        help="Run batch size experiments (default: False)",
+    )
     args = parser.parse_args()
 
     # Run the main workflow
@@ -1204,6 +1408,7 @@ def main():
         force_retrain=args.retrain,
         batch_size=args.batch_size,
         epochs=args.epochs,
+        test_batch_sizes=args.test_batch_sizes,
     )
 
     if args.run_test:

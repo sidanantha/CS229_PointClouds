@@ -9,11 +9,12 @@ import torch
 import os
 import argparse
 import csv
+import re
 from torch.utils.data import DataLoader
 
 from CorrespondanceNet import CorrespondanceNet
 from PointCloudDataset import PointCloudDataset
-from training_plots import compute_accuracy, plot_training_metrics
+from training_plots import compute_accuracy, compute_translation_accuracy, plot_training_metrics
 from learn_correspondances import visualize_probabilities, plot_point_clouds
 import utils
 
@@ -59,7 +60,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device='cpu'):
     return avg_loss
 
 
-def generate_validation_plots(model, val_dataset, num_samples=3, save_dir="neural_network/results", device='cpu'):
+def generate_validation_plots(model, val_dataset, num_samples=3, save_dir="neural_network/results", device='cpu', gt_translations_base_dir=None):
     """
     Generate validation plots similar to learn_correspondances.py
     
@@ -69,9 +70,15 @@ def generate_validation_plots(model, val_dataset, num_samples=3, save_dir="neura
         num_samples: Number of samples to visualize
         save_dir: Directory to save plots
         device: Device to run on
+        gt_translations_base_dir: Base directory containing GT translation CSV files
     """
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
+    
+    # Set up GT translations directory if not provided
+    if gt_translations_base_dir is None:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        gt_translations_base_dir = os.path.join(os.path.dirname(current_dir), "ground_truth_rotations")
     
     # Select samples to visualize (evenly spaced)
     num_samples = min(num_samples, len(val_dataset))
@@ -115,6 +122,49 @@ def generate_validation_plots(model, val_dataset, num_samples=3, save_dir="neura
             mean_max_prob = max_probs.mean()
             print(f"    Mean max prob: {mean_max_prob:.4f}")
             
+            # Compute translation using SVD from source to virtual point cloud
+            try:
+                # Convert back to torch for SVD (needs torch tensors)
+                X_torch = torch.from_numpy(X_np).float()
+                virtual_Y_torch = torch.from_numpy(virtual_Y).float()
+                R_pred, t_pred = utils.compute_svd_transform(X_torch, virtual_Y_torch)
+                
+                # Parse filename to get candidate and tau
+                match = re.search(r'(\d+)_tau_(\d+)', filename)
+                if match:
+                    candidate_num = int(match.group(1))
+                    tau_num = int(match.group(2))
+                    
+                    # Load ground truth translation
+                    gt_csv_path = os.path.join(
+                        gt_translations_base_dir,
+                        f"candidate_{candidate_num}_rotation_matrices.csv"
+                    )
+                    
+                    if os.path.exists(gt_csv_path):
+                        try:
+                            t_gt, tau_info = utils.load_gt_translation(
+                                gt_csv_path, tau_idx=tau_num
+                            )
+                            # Convert ground truth from km to meters
+                            t_gt_meters = t_gt * 1000.0
+                            
+                            # Compute translation error
+                            translation_error = utils.compute_translation_error(t_pred, t_gt_meters)
+                            
+                            # Print computed and expected translations
+                            print(f"    Computed Translation (SVD): [{t_pred[0]:.6f}, {t_pred[1]:.6f}, {t_pred[2]:.6f}] m")
+                            print(f"    Expected Translation (GT):   [{t_gt_meters[0]:.6f}, {t_gt_meters[1]:.6f}, {t_gt_meters[2]:.6f}] m")
+                            print(f"    Translation Error: {translation_error:.6f} m")
+                        except (ValueError, FileNotFoundError) as e:
+                            print(f"    Warning: Could not load GT translation: {e}")
+                    else:
+                        print(f"    Warning: GT CSV file not found: {gt_csv_path}")
+                else:
+                    print(f"    Warning: Could not parse filename to extract candidate/tau")
+            except (ValueError, RuntimeError) as e:
+                print(f"    Warning: Could not compute SVD transform: {e}")
+            
             # Save correspondances and probabilities
             np.savetxt(os.path.join(sample_dir, "correspondances.csv"), correspondances_np, delimiter=",")
             np.savetxt(os.path.join(sample_dir, "probabilities.csv"), probabilities_np, delimiter=",")
@@ -145,7 +195,7 @@ def save_training_metrics_to_csv(training_history, save_dir="neural_network/resu
     
     Args:
         training_history: Dictionary with 'train_losses', 'val_losses', 
-                         'train_accuracies', 'val_accuracies'
+                         'train_accuracies', 'val_accuracies', 'train_translation_errors', 'val_translation_errors'
         save_dir: Directory to save CSV files
     """
     os.makedirs(save_dir, exist_ok=True)
@@ -154,6 +204,10 @@ def save_training_metrics_to_csv(training_history, save_dir="neural_network/resu
     num_epochs = len(training_history['train_losses'])
     epochs = list(range(1, num_epochs + 1))
     
+    # Get translation errors if available
+    train_trans_errors = training_history.get('train_translation_errors', [float('inf')] * num_epochs)
+    val_trans_errors = training_history.get('val_translation_errors', [float('inf')] * num_epochs)
+    
     # Prepare data for CSV
     data = {
         'epoch': epochs,
@@ -161,6 +215,8 @@ def save_training_metrics_to_csv(training_history, save_dir="neural_network/resu
         'val_loss': training_history['val_losses'],
         'train_accuracy': training_history['train_accuracies'],
         'val_accuracy': training_history['val_accuracies'],
+        'train_translation_error': train_trans_errors,
+        'val_translation_error': val_trans_errors,
     }
     
     # Save to CSV
@@ -168,7 +224,7 @@ def save_training_metrics_to_csv(training_history, save_dir="neural_network/resu
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         # Write header
-        writer.writerow(['epoch', 'train_loss', 'val_loss', 'train_accuracy', 'val_accuracy'])
+        writer.writerow(['epoch', 'train_loss', 'val_loss', 'train_accuracy', 'val_accuracy', 'train_translation_error', 'val_translation_error'])
         # Write data
         for i in range(num_epochs):
             writer.writerow([
@@ -177,11 +233,13 @@ def save_training_metrics_to_csv(training_history, save_dir="neural_network/resu
                 training_history['val_losses'][i],
                 training_history['train_accuracies'][i],
                 training_history['val_accuracies'][i],
+                train_trans_errors[i],
+                val_trans_errors[i],
             ])
     
     print(f"Saved training metrics to: {csv_path}")
     print(f"  - {num_epochs} epochs recorded")
-    print(f"  - Columns: epoch, train_loss, val_loss, train_accuracy, val_accuracy")
+    print(f"  - Columns: epoch, train_loss, val_loss, train_accuracy, val_accuracy, train_translation_error, val_translation_error")
 
 
 def validate(model, val_loader, criterion, device='cpu'):
@@ -261,6 +319,12 @@ def load_or_train_model(
     val_losses = []
     train_accuracies = []
     val_accuracies = []
+    train_translation_errors = []
+    val_translation_errors = []
+    
+    # Set up GT translations directory (default to ground_truth_rotations)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    gt_translations_base_dir = os.path.join(os.path.dirname(current_dir), "ground_truth_rotations")
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch+1}/{epochs}")
@@ -277,6 +341,13 @@ def load_or_train_model(
         train_accuracies.append(train_acc)
         print(f"  Training Accuracy: {train_acc:.6f}")
         
+        # Training translation accuracy
+        train_trans_error = compute_translation_accuracy(
+            model, train_loader, gt_translations_base_dir=gt_translations_base_dir, set_name="Training"
+        )
+        train_translation_errors.append(train_trans_error)
+        print(f"  Training Translation Error: {train_trans_error:.6f} m")
+        
         # Validation
         val_loss = validate(model, val_loader, criterion, device)
         val_losses.append(val_loss)
@@ -288,6 +359,13 @@ def load_or_train_model(
         val_acc = compute_accuracy(model, val_loader)
         val_accuracies.append(val_acc)
         print(f"  Validation Accuracy: {val_acc:.6f}")
+        
+        # Validation translation accuracy
+        val_trans_error = compute_translation_accuracy(
+            model, val_loader, gt_translations_base_dir=gt_translations_base_dir, set_name="Validation"
+        )
+        val_translation_errors.append(val_trans_error)
+        print(f"  Validation Translation Error: {val_trans_error:.6f} m")
     
     # Save model
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
@@ -299,6 +377,8 @@ def load_or_train_model(
         'val_losses': val_losses,
         'train_accuracies': train_accuracies,
         'val_accuracies': val_accuracies,
+        'train_translation_errors': train_translation_errors,
+        'val_translation_errors': val_translation_errors,
     }
     
     return model, training_history
@@ -315,7 +395,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training (default: 8)')
     parser.add_argument('--dataset_dir', type=str, default='dataset',
-                        help='Directory containing 3DGS_PC folder (default: dataset)')
+                        help='Directory containing point cloud folder (default: dataset)')
+    parser.add_argument('--pc_dir', type=str, default='3DGS_PC',
+                        help='Name of point cloud directory (default: 3DGS_PC, can be 3DGS_PC_un_perturbed, etc.)')
     args = parser.parse_args()
     
     # Configuration
@@ -328,10 +410,11 @@ def main():
     print(f"Using device: {device}")
     
     # Create datasets
-    # Note: dataset_dir should point to directory containing 3DGS_PC folder
+    # Note: dataset_dir should point to directory containing the point cloud folder
     # If running from CS229_PointClouds, use "dataset"
     print(f"\n=== Creating Datasets ===")
     print(f"Dataset directory: {args.dataset_dir}")
+    print(f"Point cloud directory: {args.pc_dir}")
     print(f"Training: candidates {train_candidates}, tau range {train_tau_range}")
     print(f"Testing: candidates {test_candidates}, tau range {test_tau_range}")
     train_dataset = PointCloudDataset(
@@ -340,7 +423,8 @@ def main():
         test_candidates=test_candidates,
         train_tau_range=train_tau_range,
         test_tau_range=test_tau_range,
-        test=False
+        test=False,
+        pc_dir_name=args.pc_dir
     )
     
     val_dataset = PointCloudDataset(
@@ -349,7 +433,8 @@ def main():
         test_candidates=test_candidates,
         train_tau_range=train_tau_range,
         test_tau_range=test_tau_range,
-        test=True
+        test=True,
+        pc_dir_name=args.pc_dir
     )
     
     # Verify dataset split - show a few sample filenames
@@ -413,12 +498,16 @@ def main():
         
         # Generate validation plots on test samples
         print("\n=== Generating Validation Plots ===")
+        # Set up GT translations directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        gt_translations_base_dir = os.path.join(os.path.dirname(current_dir), "ground_truth_rotations")
         generate_validation_plots(
             model=model,
             val_dataset=val_dataset,
             num_samples=3,  # Visualize 3 test samples
             save_dir="neural_network/results",
-            device=device
+            device=device,
+            gt_translations_base_dir=gt_translations_base_dir
         )
     else:
         print("\n=== Skipping plots (model was loaded, not trained) ===")

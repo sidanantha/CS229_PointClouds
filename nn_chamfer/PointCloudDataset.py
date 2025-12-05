@@ -5,11 +5,13 @@ import numpy as np
 
 
 class PointCloudDataset(Dataset):
-    def __init__(self, dataset_dir, test=False):
+    def __init__(self, dataset_dir, test=False, train_candidates=None, test_candidates=None):
         """
         Args:
             dataset_dir: Root directory of the dataset.
-            test (bool): If False, loads folders 1-12. If True, loads folders 13-15.
+            test (bool): If False, uses train_candidates. If True, uses test_candidates.
+            train_candidates: List of candidate numbers for training/validation (e.g., [1, 2, ..., 11])
+            test_candidates: List of candidate numbers for testing (e.g., [12, 13, 14, 15])
 
         Dataset structure:
         dataset_dir/
@@ -30,11 +32,15 @@ class PointCloudDataset(Dataset):
 
         # Define valid folders based on split
         if self.test:
-            self.valid_folders = {13, 14, 15}
+            if test_candidates is None:
+                test_candidates = [12, 13, 14, 15]  # Default test candidates
+            self.valid_folders = set(test_candidates)
             split_name = "TEST"
         else:
-            self.valid_folders = set(range(1, 13))  # 1 through 12
-            split_name = "TRAIN"
+            if train_candidates is None:
+                train_candidates = list(range(1, 12))  # Default: candidates 1-11
+            self.valid_folders = set(train_candidates)
+            split_name = "TRAIN/VAL"
 
         # Collect all CSV file paths by scanning subfolders
         self.src_files = []
@@ -89,7 +95,7 @@ class PointCloudDataset(Dataset):
             )
 
         print(
-            f"[{split_name}] Found {len(self.src_files)} matching source-target pairs from folders {sorted(list(self.valid_folders))}"
+            f"[{split_name}] Found {len(self.src_files)} matching source-target pairs from candidates {sorted(list(self.valid_folders))}"
         )
 
     def __len__(self):
@@ -116,6 +122,7 @@ class PointCloudDataset(Dataset):
             "source": src,
             "target": tgt,
             "filename": filename,
+            "source_path": src_path,  # Store path for candidate extraction
         }
 
         return sample

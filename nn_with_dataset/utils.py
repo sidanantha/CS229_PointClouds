@@ -80,7 +80,7 @@ def compute_svd_transform(X, Y_hat):
     if torch.det(R) < 0:
         # Create a new Vt instead of modifying in-place
         Vt_corrected = Vt.clone()
-        Vt_corrected[-1, :] = -Vt_corrected[-1, :]
+        Vt_corrected[-1, :] = -Vt_corrected[-1, :]0
         R = Vt_corrected.T @ U.T
 
     # Compute translation
