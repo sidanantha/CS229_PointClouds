@@ -14,6 +14,7 @@ import pandas as pd
 import open3d as o3d
 from typing import Optional
 from scipy.spatial.transform import Rotation
+from trimesh.registration import transform_points
 
 
 class ICPSolver(object):
@@ -85,7 +86,18 @@ class ICPSolver(object):
             self.source = df[["x", "y", "z"]].to_numpy()
             self.orig_source = self.source.copy()
             if has_weights:
-                self.weights = df["uncertainty"].to_numpy()
+                # set the source weights to be log weights, then clip below at 0
+                self.weights = np.clip(
+                    np.log(np.sqrt(df["uncertainty"].to_numpy()) + 1e-10),
+                    a_min=0.0,
+                    a_max=None,
+                )
+                # list summary statistics of weights
+                print(f"Source Point Cloud Weights Summary:")
+                print(f"  Min: {np.min(self.weights)}")
+                print(f"  Max: {np.max(self.weights)}")
+                print(f"  Mean: {np.mean(self.weights)}")
+                print(f"  Std Dev: {np.std(self.weights)}")
         elif cloud == "target":
             self.target = df[["x", "y", "z"]].to_numpy()
         else:
@@ -123,7 +135,7 @@ class ICPSolver(object):
         cost : float
         The cost of the transformation
         """
-        matrix, transformed, cost = trimesh.registration.procrustes(
+        matrix, transformed, cost = ICPSolver.procrustes(
             self.source,
             closest,
             weights=self.weights,
@@ -174,9 +186,18 @@ class ICPSolver(object):
 
         if initial is None:
             initial = self.get_initial_transform_fpfh()
-            print(f"Estimated initial transform: {initial}")
+            print(f"Estimated initial transform:\n{initial}")
 
         self.target = np.asanyarray(self.target, dtype=np.float64)
+
+        self.plot_transform(
+            self.orig_source,
+            self.target,
+            np.eye(4),
+            save_dir="results/init",
+            iteration="before_icp",
+        )
+
         if not util.is_shape(self.target, (-1, 3)):
             raise ValueError("points must be (n,3)!")
         btree = cKDTree(self.target)
@@ -184,6 +205,15 @@ class ICPSolver(object):
         # transform a under initial_transformation
         self.source = trimesh.registration.transform_points(self.source, initial)
         total_matrix = initial
+
+        # plot after initial transformation
+        self.plot_transform(
+            self.orig_source,
+            self.target,
+            total_matrix,
+            save_dir="results/init",
+            iteration="after_initial",
+        )
 
         # start with infinite cost
         old_cost = np.inf
@@ -632,6 +662,10 @@ class ICPSolver(object):
         plt.savefig(
             os.path.join(save_dir, f"icp_transformation_{iteration}.png"), dpi=150
         )
+        print(
+            "Plot saved to ",
+            os.path.join(save_dir, f"icp_transformation_{iteration}.png"),
+        )
         plt.close(fig)
 
     @staticmethod
@@ -718,3 +752,132 @@ class ICPSolver(object):
             points.shape[0], int(points.shape[0] * rate), replace=False
         )
         return points[indices]
+
+    @staticmethod
+    def procrustes(
+        a,
+        b,
+        weights=None,
+        reflection=True,
+        translation=True,
+        scale=True,
+        return_cost=True,
+    ):
+        """
+        Trimesh.registration.procrustes function with weights support. (MIT License)
+        Perform Procrustes' analysis subject to constraints. Finds the
+        transformation T mapping a to b which minimizes the square sum
+        distances between Ta and b, also called the cost. Optionally
+        specify different weights for the points in a to minimize the
+        weighted square sum distances between Ta and b. This can
+        improve transformation robustness on noisy data if the points'
+        probability distribution is known.
+
+        Parameters
+        ----------
+        a : (n,3) float
+        List of points in space
+        b : (n,3) float
+        List of points in space
+        weights : (n,) float
+        List of floats representing how much weight is assigned to each point of a
+        reflection : bool
+        If the transformation is allowed reflections
+        translation : bool
+        If the transformation is allowed translations
+        scale : bool
+        If the transformation is allowed scaling
+        return_cost : bool
+        Whether to return the cost and transformed a as well
+
+        Returns
+        ----------
+        matrix : (4,4) float
+        The transformation matrix sending a to b
+        transformed : (n,3) float
+        The image of a under the transformation
+        cost : float
+        The cost of the transformation
+        """
+
+        a = np.asanyarray(a, dtype=np.float64)
+        b = np.asanyarray(b, dtype=np.float64)
+        if not util.is_shape(a, (-1, 3)) or not util.is_shape(b, (-1, 3)):
+            raise ValueError("points must be (n,3)!")
+        if len(a) != len(b):
+            raise ValueError("a and b must contain same number of points!")
+        if weights is not None:
+            w = np.asanyarray(weights, dtype=np.float64)
+            if len(w) != len(a):
+                raise ValueError("weights must have same length as a and b!")
+            w_norm = (w / w.sum()).reshape((-1, 1))
+
+        # Remove translation component
+        if translation:
+            # acenter is a weighted average of the individual points.
+            if weights is None:
+                acenter = a.mean(axis=0)
+            else:
+                acenter = (a * w_norm).sum(axis=0)
+            bcenter = b.mean(axis=0)
+        else:
+            acenter = np.zeros(a.shape[1])
+            bcenter = np.zeros(b.shape[1])
+
+        # Remove scale component
+        if scale:
+            if weights is None:
+                ascale = np.sqrt(((a - acenter) ** 2).sum() / len(a))
+                # ascale is the square root of weighted average of the
+                # squared difference
+                # between each point and acenter.
+            else:
+                ascale = np.sqrt((((a - acenter) ** 2) * w_norm).sum())
+
+            bscale = np.sqrt(((b - bcenter) ** 2).sum() / len(b))
+        else:
+            ascale = 1
+            bscale = 1
+
+        # Use SVD to find optimal orthogonal matrix R
+        # constrained to det(R) = 1 if necessary.
+        # w_mat is multiplied with the centered and scaled a, such that the points
+        # can be weighted differently.
+
+        if weights is None:
+            target = np.dot(((b - bcenter) / bscale).T, ((a - acenter) / ascale))
+        else:
+            target = np.dot(
+                ((b - bcenter) / bscale).T,
+                ((a - acenter) / ascale) * w_norm.reshape((-1, 1)),
+            )
+
+        u, s, vh = np.linalg.svd(target)
+
+        if reflection:
+            R = np.dot(u, vh)
+        else:
+            # no reflection allowed, so determinant must be 1.0
+            R = np.dot(np.dot(u, np.diag([1, 1, np.linalg.det(np.dot(u, vh))])), vh)
+
+        # Compute our 4D transformation matrix encoding
+        # a -> (R @ (a - acenter)/ascale) * bscale + bcenter
+        #    = (bscale/ascale)R @ a + (bcenter - (bscale/ascale)R @ acenter)
+        translation = bcenter - (bscale / ascale) * np.dot(R, acenter)
+        matrix = np.hstack((bscale / ascale * R, translation.reshape(-1, 1)))
+        matrix = np.vstack(
+            (matrix, np.array([0.0] * (a.shape[1]) + [1.0]).reshape(1, -1))
+        )
+
+        if return_cost:
+            transformed = transform_points(a, matrix)
+            squared_diff = (b - transformed) ** 2
+            sum_sq_diff_per_point = squared_diff.sum(axis=1)  # Shape (n,)
+
+            # Check if weights were provided to calculate the weighted cost
+            if weights is not None:
+                cost = (sum_sq_diff_per_point * w_norm.reshape((-1,))).sum()
+            else:
+                cost = sum_sq_diff_per_point.sum()
+
+            return matrix, transformed, cost

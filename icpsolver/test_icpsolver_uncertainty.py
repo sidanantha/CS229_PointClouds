@@ -4,20 +4,16 @@ Test for the ICPSolver class using 3DGS output PC data with uncertainty weights.
 
 import os
 import numpy as np
+import matplotlib.pyplot as plt
 
 from ICPSolver import ICPSolver
 
-DATA_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "../dataset/3DGS_PC/6/"
+UNPERTURBED_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../dataset/3DGS_PC_un_perturbed/6/"
 )
 
-TRANSFORM = np.array(  # Example transformation matrix
-    [
-        [0.866, -0.5, 0.0, 0.0],
-        [0.5, 0.866, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
+PERTURBED_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../dataset/3DGS_PC_perturbed/6/"
 )
 
 
@@ -26,8 +22,35 @@ def test_icp_uncertainty():
     Test the ICPSolver class by running alignment on successive PC output from the 3DGS.
     """
 
-    src_path = DATA_DIR + "6_tau_60.csv"
-    tgt_path = DATA_DIR + "6_tau_0.csv"
+    src_path = PERTURBED_DATA_DIR + "6_tau_3.csv"
+    tgt_path = UNPERTURBED_DATA_DIR + "6_tau_3.csv"
+
+    # # create histogram of uncertainty weights in source point cloud
+    # src_data = np.loadtxt(src_path, delimiter=",", skiprows=1)
+    # weights = src_data[:, 3]
+    # # # plt.hist(weights, bins=30)
+    # # # plt.title("Histogram of Uncertainty Weights in Source Point Cloud")
+    # # # plt.xlabel("Uncertainty Weight")
+    # # # plt.ylabel("Frequency")
+    # # # plt.show()
+
+    # # alternatively plot a histogram of the log of the weights
+    # plt.hist(
+    #     np.log(np.sqrt(weights) + 1e-10), bins=30
+    # )  # add small constant to avoid log(0)
+    # plt.title("Histogram of Log of Uncertainty Weights in Source Point Cloud")
+    # plt.xlabel("Log of Uncertainty Weight")
+    # plt.ylabel("Frequency")
+    # plt.show()
+
+    # # print summary statistics of weights
+    # print(f"Source Point Cloud Uncertainty Weights Summary:")
+    # print(f"  Min: {np.min(weights)}")
+    # print(f"  Max: {np.max(weights)}")
+    # print(f"  Mean: {np.mean(weights)}")
+    # print(f"  Std Dev: {np.std(weights)}")
+
+    # breakpoint()
 
     # Initialize the ICP solver
     icp_solver = ICPSolver(
@@ -41,7 +64,9 @@ def test_icp_uncertainty():
     print("Loaded point clouds to solver")
 
     # Perform ICP alignment
-    matrix, transformed, cost = icp_solver.icp(reflection=False, scale=False)
+    matrix, transformed, cost = icp_solver.icp(
+        initial=None, reflection=False, scale=False
+    )
     print("ICP alignment completed.")
     print(f"Final transformation matrix:\n{matrix}")
     print(f"Final alignment cost: {cost}")

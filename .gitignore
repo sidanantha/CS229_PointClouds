@@ -1,2 +1,5 @@
 .vscode/
 venv/
+dataset/
+__pycache__/
+*.pyc

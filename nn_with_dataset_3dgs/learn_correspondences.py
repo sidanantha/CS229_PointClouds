@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 import utils
 from CorrespondanceNet import CorrespondanceNet
 from PointCloudDataset import PointCloudDataset
+from training_plots import compute_accuracy, plot_training_metrics
 
 
 def load_or_train_model(
@@ -21,7 +22,7 @@ def load_or_train_model(
     force_retrain=False,
     model_path="output/correspondance_net.pth",
     epochs=100,
-    lr=0.001,
+    lr=0.01,
 ):
     """
     Load an existing model or train a new one using DataLoader.
@@ -42,6 +43,14 @@ def load_or_train_model(
         print(f"Model found at {model_path}. Loading existing model...")
         model = CorrespondanceNet.from_checkpoint(model_path)
         model.eval()
+        # If loading existing model, return empty history
+        training_history = {
+            'train_losses': [],
+            'val_losses': [],
+            'train_accuracies': [],
+            'val_accuracies': [],
+        }
+        return model, training_history
     else:
         if force_retrain and os.path.exists(model_path):
             print(
@@ -52,15 +61,16 @@ def load_or_train_model(
 
         # Create the neural network and optimizer
         model = CorrespondanceNet()
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         criterion = torch.nn.MSELoss()
 
         # Train the network
         print(f"Training the CorrespondanceNet for {epochs} epochs...")
 
         train_losses = []
-
         val_losses = []
+        train_accuracies = []
+        val_accuracies = []
 
         total_batches = len(train_loader)
         print_every = max(1, total_batches // 10)  # Print ~10 times per epoch
@@ -83,13 +93,63 @@ def load_or_train_model(
                     X = X_batch[i]  # (N, 3)
                     Y = Y_batch[i]  # (M, 3)
 
-                    # Compute correspondences: m(x_i, Y) for each point in X
-                    correspondances = model.compute_correspondances(X, Y)
-                    probabilities = model.softmax_correspondances(correspondances)
-                    Y_hat = model.virtual_point(probabilities, Y)  # (N, 3)
+                    # Handle different-sized point clouds: prune to smaller size
+                    min_size = min(X.shape[0], Y.shape[0])
+                    if X.shape[0] > min_size:
+                        # Randomly sample X to match Y size
+                        indices = torch.randperm(X.shape[0], device=X.device)[:min_size]
+                        X = X[indices]
+                    if Y.shape[0] > min_size:
+                        # Randomly sample Y to match X size
+                        indices = torch.randperm(Y.shape[0], device=Y.device)[:min_size]
+                        Y = Y[indices]
+                    
+                    # Now X and Y have the same size (min_size, 3)
+                    
+                    # Compute distance-based cost matrix for optimal transport
+                    C = model.compute_distance_cost(X, Y)  # (N, N) cost matrix
+                    
+                    # Rescale C by its mean to normalize the cost matrix
+                    # This prevents Sinkhorn from seeing everything as identical
+                    C_mean = C.mean()
+                    if C_mean > 1e-8:  # Avoid division by zero
+                        C = C / C_mean
+                    
+                    # # Print C matrix before Sinkhorn
+                    # print(f"\n=== C Matrix (Cost) ===")
+                    # print(f"Shape: {C.shape}")
+                    # print(f"Min: {C.min().item():.4f}, Max: {C.max().item():.4f}, Mean: {C.mean().item():.4f}")
+                    # print(f"C matrix (first 10x10):")
+                    # print(C[:10, :10].detach().cpu().numpy())
+                    
+                    # Check for NaN/Inf in cost matrix
+                    if torch.isnan(C).any() or torch.isinf(C).any():
+                        print("Warning: NaN/Inf detected in C matrix, skipping batch")
+                        continue
+                    
+                    # Convert cost to log-scores for Sinkhorn: log_scores = -C / epsilon
+                    epsilon = 2.0  # Regularization parameter
+                    log_scores = -C / epsilon
+                    
+                    # Apply correct log-domain Sinkhorn
+                    S = model.log_sinkhorn(log_scores, num_iterations=10)  # (N, N) doubly stochastic
+                    
+                    # Check for NaN/Inf in S
+                    if torch.isnan(S).any() or torch.isinf(S).any():
+                        continue
+                    
+                    # Compute virtual point cloud: Y_hat = S @ Y
+                    Y_hat = model.virtual_point(S, Y)  # (N, 3)
+                    
+                    # Check for NaN/Inf in Y_hat
+                    if torch.isnan(Y_hat).any() or torch.isinf(Y_hat).any():
+                        continue
 
-                    loss = criterion(Y_hat, Y)
-                    batch_loss += loss
+                    # Optimal Transport Loss: weighted average of distances under transport plan S
+                    # Loss = <S, C> = sum_ij S_ij * C_ij
+                    ot_loss = (S * C).sum()
+                    
+                    batch_loss += ot_loss
 
                 # Average loss over batch
                 batch_loss = batch_loss / len(X_batch)
@@ -97,6 +157,8 @@ def load_or_train_model(
                 # Backward pass
                 optimizer.zero_grad()
                 batch_loss.backward()
+                # Gradient clipping to prevent explosion (which could cause collapse)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 epoch_loss += batch_loss.item()
@@ -115,6 +177,11 @@ def load_or_train_model(
             train_losses.append(avg_epoch_loss)
 
             print(f"Epoch {epoch+1}/{epochs} Complete - Loss: {avg_epoch_loss:.6f}")
+            
+            # Compute training accuracy
+            train_acc = compute_accuracy(model, train_loader)
+            train_accuracies.append(train_acc)
+            print(f"  Training Accuracy: {train_acc:.6f}")
 
             # Validation (optional)
             if val_loader is not None:
@@ -133,14 +200,40 @@ def load_or_train_model(
                             X = X_batch[i]
                             Y = Y_batch[i]
 
-                            correspondances = model.compute_correspondances(X, Y)
-                            probabilities = model.softmax_correspondances(
-                                correspondances
-                            )
-                            Y_hat = model.virtual_point(probabilities, Y)
+                            # Handle different-sized point clouds: prune to smaller size
+                            min_size = min(X.shape[0], Y.shape[0])
+                            if X.shape[0] > min_size:
+                                indices = torch.randperm(X.shape[0], device=X.device)[:min_size]
+                                X = X[indices]
+                            if Y.shape[0] > min_size:
+                                indices = torch.randperm(Y.shape[0], device=Y.device)[:min_size]
+                                Y = Y[indices]
+                            
+                            # Compute distance-based cost matrix
+                            C = model.compute_distance_cost(X, Y)
+                            # Rescale C by its mean to normalize
+                            C_mean = C.mean()
+                            if C_mean > 1e-8:
+                                C = C / C_mean
+                            if torch.isnan(C).any() or torch.isinf(C).any():
+                                continue
+                            
+                            # Apply log-domain Sinkhorn
+                            epsilon = 2.0
+                            log_scores = -C / epsilon
+                            S = model.log_sinkhorn(log_scores, num_iterations=10)
+                            
+                            if torch.isnan(S).any() or torch.isinf(S).any():
+                                continue
+                            
+                            Y_hat = model.virtual_point(S, Y)
+                            
+                            if torch.isnan(Y_hat).any() or torch.isinf(Y_hat).any():
+                                continue
 
-                            loss = criterion(Y_hat, Y)
-                            val_loss += loss.item()
+                            # Optimal Transport Loss
+                            ot_loss = (S * C).sum()
+                            val_loss += ot_loss.item()
 
                         val_batches += len(X_batch)
 
@@ -148,6 +241,13 @@ def load_or_train_model(
                 print(f"  Validation Loss: {avg_val_loss:.6f}")
 
                 val_losses.append(avg_val_loss)
+                
+                # Compute validation accuracy
+                val_acc = compute_accuracy(model, val_loader)
+                val_accuracies.append(val_acc)
+                print(f"  Validation Accuracy: {val_acc:.6f}")
+            else:
+                val_accuracies.append(0.0)
 
             # ---- Save per-epoch plots ----
             # Save per-epoch loss plots and concise diagnostics (moved to helper)
@@ -230,8 +330,15 @@ def load_or_train_model(
 
         # Set to evaluation mode for inference
         model.eval()
-
-    return model
+        
+        # Return training history
+        training_history = {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_accuracies': train_accuracies,
+            'val_accuracies': val_accuracies,
+        }
+        return model, training_history
 
 
 def load_model(model_path="models/correspondance_net.pth"):
@@ -281,8 +388,15 @@ def compute_virtual_point_cloud(model, P, Q):
     # Compute correspondances
     correspondances = model.compute_correspondances(P_tensor, Q_tensor)
 
-    # Compute probabilities
-    probabilities = model.softmax_correspondances(correspondances)
+    # Compute distance-based cost and apply log-domain Sinkhorn
+    C = model.compute_distance_cost(P_tensor, Q_tensor)
+    # Rescale C by its mean to normalize
+    C_mean = C.mean()
+    if C_mean > 1e-8:
+        C = C / C_mean
+    epsilon = 2.0
+    log_scores = -C / epsilon
+    probabilities = model.log_sinkhorn(log_scores, num_iterations=10)
 
     # Compute virtual point cloud
     virtual_Q = model.virtual_point(probabilities, Q_tensor)
@@ -721,12 +835,233 @@ def run_training_and_visualization(
 
     # Load or train model
     print("\n=== Loading/Training Model ===")
-    model = load_or_train_model(
+    model, training_history = load_or_train_model(
         train_loader,
         val_loader,
         force_retrain=force_retrain,
         epochs=epochs,
     )
+    
+    # Train with different batch sizes for batch size analysis
+    # Only do this if we actually trained (not just loaded)
+    if force_retrain or len(training_history['train_losses']) > 0:
+        print("\n=== Training with Different Batch Sizes ===")
+        batch_sizes_to_test = [1, 2, 4, 8, 16, 32, 64, 100]
+        fixed_epochs_for_batch_size = 100  # Number of epochs to train for each batch size
+        batch_size_results = {
+            'batch_sizes': [],
+            'train_losses': [],
+            'val_losses': [],
+            'train_accuracies': [],
+            'val_accuracies': [],
+        }
+        
+        for bs in batch_sizes_to_test:
+            print(f"\n--- Training with batch_size={bs} ---")
+            
+            # Create new data loaders with this batch size
+            train_loader_bs = DataLoader(
+                train_dataset,
+                batch_size=bs,
+                shuffle=True,
+                num_workers=0,
+                collate_fn=utils.collate_fn,
+            )
+            val_loader_bs = DataLoader(
+                val_dataset,
+                batch_size=bs,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=utils.collate_fn,
+            )
+            
+            # Train model with this batch size
+            model_bs = CorrespondanceNet()
+            optimizer = torch.optim.Adam(model_bs.parameters(), lr=0.01)
+            criterion = torch.nn.MSELoss()
+            
+            # Train for fixed epochs
+            for epoch in range(fixed_epochs_for_batch_size):
+                model_bs.train()
+                epoch_loss = 0.0
+                num_batches = 0
+                
+                for batch in train_loader_bs:
+                    X_batch = batch["source"]
+                    Y_batch = batch["target"]
+                    
+                    batch_loss = torch.tensor(0.0)
+                    for i in range(len(X_batch)):
+                        X = X_batch[i]
+                        Y = Y_batch[i]
+                        
+                        # Handle different-sized point clouds: prune to smaller size
+                        min_size = min(X.shape[0], Y.shape[0])
+                        if X.shape[0] > min_size:
+                            indices = torch.randperm(X.shape[0], device=X.device)[:min_size]
+                            X = X[indices]
+                        if Y.shape[0] > min_size:
+                            indices = torch.randperm(Y.shape[0], device=Y.device)[:min_size]
+                            Y = Y[indices]
+                        
+                        # Compute distance-based cost matrix
+                        C = model_bs.compute_distance_cost(X, Y)
+                        # Rescale C by its mean to normalize
+                        C_mean = C.mean()
+                        if C_mean > 1e-8:
+                            C = C / C_mean
+                        if torch.isnan(C).any() or torch.isinf(C).any():
+                            continue
+                        
+                        # Apply log-domain Sinkhorn
+                        epsilon = 2.0
+                        log_scores = -C / epsilon
+                        S = model_bs.log_sinkhorn(log_scores, num_iterations=10)
+                        
+                        if torch.isnan(S).any() or torch.isinf(S).any():
+                            continue
+                        
+                        Y_hat = model_bs.virtual_point(S, Y)
+                        
+                        if torch.isnan(Y_hat).any() or torch.isinf(Y_hat).any():
+                            continue
+                        
+                        # Optimal Transport Loss
+                        ot_loss = (S * C).sum()
+                        batch_loss += ot_loss
+                    
+                    batch_loss = batch_loss / len(X_batch)
+                    optimizer.zero_grad()
+                    batch_loss.backward()
+                    optimizer.step()
+                    
+                    epoch_loss += batch_loss.item()
+                    num_batches += 1
+            
+            # Evaluate final model
+            model_bs.eval()
+            final_train_loss = 0.0
+            final_val_loss = 0.0
+            train_batches = 0
+            val_batches = 0
+            
+            with torch.no_grad():
+                for batch in train_loader_bs:
+                    X_batch = batch["source"]
+                    Y_batch = batch["target"]
+                    for i in range(len(X_batch)):
+                        X = X_batch[i]
+                        Y = Y_batch[i]
+                        # Handle different-sized point clouds: prune to smaller size
+                        min_size = min(X.shape[0], Y.shape[0])
+                        if X.shape[0] > min_size:
+                            indices = torch.randperm(X.shape[0], device=X.device)[:min_size]
+                            X = X[indices]
+                        if Y.shape[0] > min_size:
+                            indices = torch.randperm(Y.shape[0], device=Y.device)[:min_size]
+                            Y = Y[indices]
+                        
+                        # Compute distance-based cost matrix
+                        C = model_bs.compute_distance_cost(X, Y)
+                        # Rescale C by its mean to normalize
+                        C_mean = C.mean()
+                        if C_mean > 1e-8:
+                            C = C / C_mean
+                        if torch.isnan(C).any() or torch.isinf(C).any():
+                            continue
+                        
+                        # Apply log-domain Sinkhorn
+                        epsilon = 2.0
+                        log_scores = -C / epsilon
+                        S = model_bs.log_sinkhorn(log_scores, num_iterations=10)
+                        
+                        if torch.isnan(S).any() or torch.isinf(S).any():
+                            continue
+                        
+                        Y_hat = model_bs.virtual_point(S, Y)
+                        
+                        if torch.isnan(Y_hat).any() or torch.isinf(Y_hat).any():
+                            continue
+                        
+                        # Optimal Transport Loss
+                        ot_loss = (S * C).sum()
+                        final_train_loss += ot_loss.item()
+                        train_batches += 1
+                
+                for batch in val_loader_bs:
+                    X_batch = batch["source"]
+                    Y_batch = batch["target"]
+                    for i in range(len(X_batch)):
+                        X = X_batch[i]
+                        Y = Y_batch[i]
+                        # Handle different-sized point clouds: prune to smaller size
+                        min_size = min(X.shape[0], Y.shape[0])
+                        if X.shape[0] > min_size:
+                            indices = torch.randperm(X.shape[0], device=X.device)[:min_size]
+                            X = X[indices]
+                        if Y.shape[0] > min_size:
+                            indices = torch.randperm(Y.shape[0], device=Y.device)[:min_size]
+                            Y = Y[indices]
+                        
+                        # Compute distance-based cost matrix
+                        C = model_bs.compute_distance_cost(X, Y)
+                        # Rescale C by its mean to normalize
+                        C_mean = C.mean()
+                        if C_mean > 1e-8:
+                            C = C / C_mean
+                        if torch.isnan(C).any() or torch.isinf(C).any():
+                            continue
+                        
+                        # Apply log-domain Sinkhorn
+                        epsilon = 2.0
+                        log_scores = -C / epsilon
+                        S = model_bs.log_sinkhorn(log_scores, num_iterations=10)
+                        
+                        if torch.isnan(S).any() or torch.isinf(S).any():
+                            continue
+                        
+                        Y_hat = model_bs.virtual_point(S, Y)
+                        
+                        if torch.isnan(Y_hat).any() or torch.isinf(Y_hat).any():
+                            continue
+                        
+                        # Optimal Transport Loss
+                        ot_loss = (S * C).sum()
+                        final_val_loss += ot_loss.item()
+                        val_batches += 1
+            
+            final_train_loss = final_train_loss / train_batches if train_batches > 0 else 0.0
+            final_val_loss = final_val_loss / val_batches if val_batches > 0 else 0.0
+            
+            final_train_acc = compute_accuracy(model_bs, train_loader_bs)
+            final_val_acc = compute_accuracy(model_bs, val_loader_bs)
+            
+            batch_size_results['batch_sizes'].append(bs)
+            batch_size_results['train_losses'].append(final_train_loss)
+            batch_size_results['val_losses'].append(final_val_loss)
+            batch_size_results['train_accuracies'].append(final_train_acc)
+            batch_size_results['val_accuracies'].append(final_val_acc)
+            
+            print(f"  Final Train Loss: {final_train_loss:.6f}, Train Acc: {final_train_acc:.6f}")
+            print(f"  Final Val Loss: {final_val_loss:.6f}, Val Acc: {final_val_acc:.6f}")
+        
+        # Create the 2x2 plot after all batch sizes are tested
+        print("\n=== Generating Training Metrics Plot ===")
+        plot_training_metrics(
+            train_losses_vs_epochs=training_history['train_losses'],
+            val_losses_vs_epochs=training_history['val_losses'],
+            train_accs_vs_epochs=training_history['train_accuracies'],
+            val_accs_vs_epochs=training_history['val_accuracies'],
+            train_losses_vs_batch=batch_size_results['train_losses'],
+            val_losses_vs_batch=batch_size_results['val_losses'],
+            train_accs_vs_batch=batch_size_results['train_accuracies'],
+            val_accs_vs_batch=batch_size_results['val_accuracies'],
+            batch_sizes=batch_size_results['batch_sizes'],
+            save_path="output/training_metrics.png",
+        )
+    else:
+        print("\n=== Skipping batch size experiments (model was loaded, not trained) ===")
+        print("Use --retrain flag to generate training plots.")
 
 
 def test_model(save_path="output/test/"):
@@ -787,8 +1122,24 @@ def test_model(save_path="output/test/"):
             X = X_batch[i]
             Y = Y_batch[i]
 
-            correspondances = model.compute_correspondances(X, Y)
-            probabilities = model.softmax_correspondances(correspondances)
+            # Handle different-sized point clouds: prune to smaller size
+            min_size = min(X.shape[0], Y.shape[0])
+            if X.shape[0] > min_size:
+                indices = torch.randperm(X.shape[0], device=X.device)[:min_size]
+                X = X[indices]
+            if Y.shape[0] > min_size:
+                indices = torch.randperm(Y.shape[0], device=Y.device)[:min_size]
+                Y = Y[indices]
+            
+            # Compute distance-based cost and apply log-domain Sinkhorn
+            C = model.compute_distance_cost(X, Y)
+            # Rescale C by its mean to normalize
+            C_mean = C.mean()
+            if C_mean > 1e-8:
+                C = C / C_mean
+            epsilon = 2.0
+            log_scores = -C / epsilon
+            probabilities = model.log_sinkhorn(log_scores, num_iterations=10)
             Y_hat = model.virtual_point(probabilities, Y)
 
             R, t = utils.compute_svd_transform(X, Y_hat)
@@ -834,9 +1185,6 @@ def main():
         help="Evaluate trained model on test set after training (default: False)",
     )
     args = parser.parse_args()
-
-    # Determine which loss to use
-    use_dcp = args.use_dcp_loss and not args.use_mse_loss
 
     # Run the main workflow
     run_training_and_visualization(
