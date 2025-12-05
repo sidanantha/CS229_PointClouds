@@ -79,7 +79,7 @@ def load_or_train_model(
     val_loader=None,
     force_retrain=False,
     model_path="output/correspondance_net.pth",
-    epochs=100,
+    epochs=20,
     lr=0.01,
 ):
     """
@@ -792,7 +792,7 @@ def run_training_and_visualization(
     dataset_dir,
     force_retrain=False,
     batch_size=8,
-    epochs=100,
+    epochs=20,
 ):
     """
     Main workflow: load dataset, train model, compute virtual point cloud, and visualize.
@@ -876,7 +876,7 @@ def run_training_and_visualization(
     if force_retrain or len(training_history['train_losses']) > 0:
         print("\n=== Training with Different Batch Sizes ===")
         batch_sizes_to_test = [1, 2, 4, 8, 16, 32, 64, 100]
-        fixed_epochs_for_batch_size = 100  # Number of epochs to train for each batch size
+        fixed_epochs_for_batch_size = 20  # Number of epochs to train for each batch size
         batch_size_results = {
             'batch_sizes': [],
             'train_losses': [],
@@ -1188,8 +1188,8 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=100,
-        help="Number of training epochs (default: 100)",
+        default=20,
+        help="Number of training epochs (default: 20)",
     )
     parser.add_argument(
         "--run_test",
