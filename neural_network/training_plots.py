@@ -327,7 +327,7 @@ def plot_combined_mse_chamfer_metrics(
     save_path="CS229_PointClouds/neural_network/results/combined_training_metrics.png",
 ):
     """
-    Create a 1x2 plot showing loss and accuracy vs epochs for both MSE and Chamfer metrics.
+    Create a 2x1 plot showing loss and accuracy vs epochs for both MSE and Chamfer metrics.
     MSE metrics are shown in solid lines, Chamfer metrics in dashed lines.
     
     Args:
@@ -384,50 +384,51 @@ def plot_combined_mse_chamfer_metrics(
     if mse_data is None and chamfer_data is None:
         raise ValueError("At least one CSV file must exist to create the plot")
     
-    # Create 1x2 plot
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Create 2x1 plot (2 rows, 1 column)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 12))
     
-    # Plot 1: Loss vs Epochs
+    # Plot 1: Loss vs Epochs (top)
     ax1 = axes[0]
     
     if mse_data is not None:
         ax1.plot(mse_data['epochs'], mse_data['train_losses'], 'r-', 
-                label='MSE train', linewidth=2)
+                label='MSE train', linewidth=4)
         ax1.plot(mse_data['epochs'], mse_data['val_losses'], 'b-', 
-                label='MSE validation', linewidth=2)
+                label='MSE validation', linewidth=4)
     
     if chamfer_data is not None:
         ax1.plot(chamfer_data['epochs'], chamfer_data['train_losses'], 'r--', 
-                label='Chamfer train', linewidth=2)
+                label='Chamfer train', linewidth=4)
         ax1.plot(chamfer_data['epochs'], chamfer_data['val_losses'], 'b--', 
-                label='Chamfer validation', linewidth=2)
+                label='Chamfer validation', linewidth=4)
     
-    ax1.set_xlabel('Epochs', fontsize=12)
-    ax1.set_ylabel('Loss', fontsize=12)
-    ax1.set_title('Loss vs Epochs', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Epochs', fontsize=28)
+    ax1.set_ylabel('Loss', fontsize=28)
+    ax1.set_title('Loss vs Epochs', fontsize=30, fontweight='bold')
+    ax1.tick_params(labelsize=22)
     ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    ax1.legend(fontsize=20)
     
-    # Plot 2: Accuracy vs Epochs
+    # Plot 2: Accuracy vs Epochs (bottom)
     ax2 = axes[1]
     
     if mse_data is not None:
         ax2.plot(mse_data['epochs'], mse_data['train_accuracies'], 'r-', 
-                label='MSE train', linewidth=2)
+                linewidth=4)
         ax2.plot(mse_data['epochs'], mse_data['val_accuracies'], 'b-', 
-                label='MSE validation', linewidth=2)
+                linewidth=4)
     
     if chamfer_data is not None:
         ax2.plot(chamfer_data['epochs'], chamfer_data['train_accuracies'], 'r--', 
-                label='Chamfer train', linewidth=2)
+                linewidth=4)
         ax2.plot(chamfer_data['epochs'], chamfer_data['val_accuracies'], 'b--', 
-                label='Chamfer validation', linewidth=2)
+                linewidth=4)
     
-    ax2.set_xlabel('Epochs', fontsize=12)
-    ax2.set_ylabel('Accuracy', fontsize=12)
-    ax2.set_title('Accuracy vs Epochs', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Epochs', fontsize=28)
+    ax2.set_ylabel('Accuracy', fontsize=28)
+    ax2.set_title('Accuracy vs Epochs', fontsize=30, fontweight='bold')
+    ax2.tick_params(labelsize=22)
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
     
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
